@@ -33,8 +33,26 @@
   <link rel="manifest" href="manifest.json">
 
   <!-- Google Maps JavaScript API — used by google_maps_flutter on web
-       (GPS Live Tracking / LiveTrackingScreen). -->
-  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDQZui_o-2yA7KxLjYHUK9ORa97jWEcXoU"></script>
+       (GPS Live Tracking / LiveTrackingScreen). Pinned to the quarterly
+       channel (v=quarterly) — no version param defaults to the weekly
+       channel, which ships breaking changes far more often and is not
+       what a production app should run against. Same API key as before.
+
+       KNOWN LOCAL-DEV FAILURE (confirmed, not caused by v=quarterly —
+       reproduced identically with and without it against Google's live
+       servers): this API key has an HTTP referrer restriction in Google
+       Cloud Console that only allows the published app's domain. Running
+       locally (`flutter run -d chrome`, served from http://localhost:PORT)
+       is NOT on that allow-list, so Google's own JS rejects it with
+       RefererNotAllowedMapError and paints "Oops! Something went wrong.
+       This page didn't load Google Maps correctly." directly into the map
+       — entirely inside Google's script, never as a Dart exception, so
+       nothing in main.dart can catch or log it except the gm_authFailure
+       hook (see maps_auth_failure_web.dart / main()'s
+       _installGoogleMapsAuthFailureLogging). To fix local dev: add your
+       local origin(s) to this key's allowed HTTP referrers in Google Cloud
+       Console, or use a separate unrestricted key for local builds. -->
+  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDQZui_o-2yA7KxLjYHUK9ORa97jWEcXoU&v=quarterly"></script>
 </head>
 <body>
   <!--

@@ -55,6 +55,15 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.canAccessGarage == true;
     }
 
+    // Warehouse module access (WarehouseScreen / AuthGate's routing
+    // override), set per-account via AddUserScreen/ManageUsersScreen's
+    // Warehouse Access checkbox/toggle — independent of canAccessGarage
+    // above (either, both, or neither can be granted to the same account).
+    function canAccessWarehouse() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.canAccessWarehouse == true;
+    }
+
     // ---- users ----
     // Read is broad (not owner/admin-restricted): supervisors query other
     // users' profiles for pickers/dropdowns in several places (Machine
@@ -121,16 +130,16 @@ service cloud.firestore {
       allow write: if isAdminOrOwner() || canAccessGarage();
     }
     // Warehouse Inventory (WarehouseScreen, reachable from AdminDashboard
-    // only) — isolated from trucks/bikes/work_records, same as the Garage
-    // module. No separate access-flag toggle like canAccessGarage exists
-    // for this yet, so it's admin/owner-only for now.
+    // and from a canAccessWarehouse technician account via AuthGate's
+    // routing override) — isolated from trucks/bikes/work_records, same as
+    // the Garage module.
     match /warehouse_items/{itemId} {
       allow read: if isSignedIn();
-      allow write: if isAdminOrOwner();
+      allow write: if isAdminOrOwner() || canAccessWarehouse();
     }
     match /warehouse_items/{itemId}/stockMovements/{entryId} {
       allow read: if isSignedIn();
-      allow write: if isAdminOrOwner();
+      allow write: if isAdminOrOwner() || canAccessWarehouse();
     }
     // Admin-managed master list of Loading Category names (Availability
     // screen) — SiteManagementScreen's Site Edit dialog reads this live to
@@ -138,6 +147,19 @@ service cloud.firestore {
     match /loading_availability_options/{optionId} {
       allow read: if isSignedIn();
       allow write: if isAdminOrOwner();
+    }
+    // Admin-configured fixed route distances (Loading Site -> Unloading
+    // Site pairs, doc id "{loadingSiteId}_{unloadingSiteId}"), managed via
+    // RouteDistanceManagementScreen and looked up by the Supervisor app
+    // (QR Scan flow / NewWorkDialog) to auto-populate a Company Load's
+    // distanceKm at creation time. Read is broad since that lookup happens
+    // from the Supervisor's own session. Write stays broad management
+    // access on purpose — no extra per-account permission flag, unlike
+    // canManagementEditReports()/canManagementAccessTransportRecords()
+    // above.
+    match /route_distances/{routeId} {
+      allow read: if isSignedIn();
+      allow write: if isAdminOrOwner() || isManagement();
     }
     match /fuel_stations/{stationId} {
       allow read: if isSignedIn();
@@ -269,6 +291,111 @@ service cloud.firestore {
         allow write: if isSignedIn() &&
           (get(/databases/$(database)/documents/truck_sessions/$(sessionId)).data.driverUid
             == request.auth.uid || isAdminOrOwner());
+      }
+    }
+
+    // ---- Truck Repair v2 + Service (repairs, repair_lists,
+    // repair_categories, counters, settings, service_items,
+    // service_records, manual_km_logs) ----
+    // None of these had ANY match block before — every read/write here was
+    // caught by the default-deny catch-all below, independent of the
+    // app's own repairPermissions/hasRepairPerm(key) checks. That's the
+    // confirmed root cause of "technician marks a repair DONE but it never
+    // reaches Final Approval" and of RepairCategoriesScreen's earlier
+    // "Taking too long" bug (see its _loadAccess/_buildCategoriesStream
+    // [REPCAT] comments).
+    //
+    // Gate mirrors hasRepairPerm() in lib/main.dart at a collection
+    // granularity: admin/owner always allowed, 'driver' never allowed,
+    // anyone else needs at least one repairPermissions entry (or either
+    // legacy flag hasRepairPerm() also honors). Rules can't cheaply
+    // replicate hasRepairPerm's per-KEY gating (REPORT_DEFECT to create
+    // vs APPROVE to approve vs SERVICE_APPROVE to approve service, etc.)
+    // the way the Dart function does — the app UI already enforces that
+    // per screen/button; these rules are the backstop against a driver or
+    // a zero-permission account touching this data directly, same
+    // philosophy as users/{userId}'s broad read above.
+    function myUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function hasAnyRepairPerm() {
+      return isAdminOrOwner() || (
+        isSignedIn() && myRole() != 'driver' && (
+          myUserData().get('repairPermissions', []).size() > 0 ||
+          myUserData().get('canApproveRepairs', false) == true ||
+          myUserData().get('canManageRepairPayments', false) == true
+        )
+      );
+    }
+
+    match /repairs/{repairId} {
+      allow read, write: if hasAnyRepairPerm();
+      match /events/{eventId} {
+        allow read, write: if hasAnyRepairPerm();
+      }
+    }
+    match /repair_lists/{listId} {
+      allow read, write: if hasAnyRepairPerm();
+    }
+    // Reference data (category names/sort order) — read by any non-driver
+    // signed-in user (AddRepairScreen's category picker needs it), write
+    // stays admin/owner only, matching RepairCategoriesScreen's own
+    // in-app _loadAccess gate.
+    match /repair_categories/{categoryId} {
+      allow read: if isSignedIn() && myRole() != 'driver';
+      allow write: if isAdminOrOwner();
+    }
+    // Shared transactional running-number generator — also used by
+    // unrelated non-repair numbering (_nextRepairSequenceNumber's
+    // defectNo/jobNo). No sensitive content, just {value: N}.
+    match /counters/{counterId} {
+      allow read, write: if isSignedIn();
+    }
+    // Shared app settings docs (repair_numbering's companyPrefix,
+    // repair_workflow's testModeAllowSameUser/requireDailyCheck, plus
+    // unrelated settings elsewhere in the app) — reference data read by
+    // any signed-in user, admin/owner-managed.
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdminOrOwner();
+      match /events/{eventId} {
+        allow read: if isSignedIn();
+        allow write: if isAdminOrOwner();
+      }
+    }
+
+    // ---- Service (scheduled vehicle service items, km-based) ----
+    match /service_items/{itemId} {
+      allow read, write: if hasAnyRepairPerm();
+      match /events/{eventId} {
+        allow read, write: if hasAnyRepairPerm();
+      }
+    }
+    match /service_records/{recordId} {
+      allow read, write: if hasAnyRepairPerm();
+      match /events/{eventId} {
+        allow read, write: if hasAnyRepairPerm();
+      }
+    }
+    // Technician's manual "log today's odometer" entries — the fallback
+    // current-km source when GPS/Traccar is unavailable (see
+    // fetchKmByVehicleForAlerts). Append-only log, same access shape as
+    // the service collections above.
+    match /manual_km_logs/{logId} {
+      allow read, write: if hasAnyRepairPerm();
+    }
+
+    // ---- daily_checks (driver daily level checks: water/engine
+    // oil/hydraulic oil — DriverDailyCheckScreen/DailyChecksScreen) ----
+    // Also had no match block at all. Broad signed-in access on purpose —
+    // unlike the collections above, this one is driver-authored by
+    // design (a driver must be able to create/read their own submission),
+    // and DailyChecksScreen's management view reads every driver's
+    // checks regardless of repair permissions.
+    match /daily_checks/{checkId} {
+      allow read, write: if isSignedIn();
+      match /events/{eventId} {
+        allow read, write: if isSignedIn();
       }
     }
 

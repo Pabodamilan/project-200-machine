@@ -1,5 +1,83 @@
 {
-  "indexes": [],
+  "indexes": [
+    {
+      "collectionGroup": "work_records",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "isLoadingCategory", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "work_records",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "isLoadingCategory", "order": "ASCENDING" },
+        { "fieldPath": "siteName", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "work_records",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "isLoadingCategory", "order": "ASCENDING" },
+        { "fieldPath": "machineName", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "work_records",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "isLoadingCategory", "order": "ASCENDING" },
+        { "fieldPath": "siteName", "order": "ASCENDING" },
+        { "fieldPath": "machineName", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "defect_reports",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "vehicleNumber", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "repair_jobs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "simpleMode", "order": "ASCENDING" },
+        { "fieldPath": "repairStatus", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "repairs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "reportedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "repairs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "vehicleNumber", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "reportedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "repairs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "vehicleNumber", "order": "ASCENDING" },
+        { "fieldPath": "reportedAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
   "fieldOverrides": [
     {
       "collectionGroup": "work_records",
@@ -46,6 +124,20 @@
     {
       "collectionGroup": "work_records",
       "fieldPath": "isLoadingCategory",
+      "indexes": [
+        {
+          "queryScope": "COLLECTION_GROUP",
+          "order": "ASCENDING"
+        },
+        {
+          "queryScope": "COLLECTION",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "work_records",
+      "fieldPath": "date",
       "indexes": [
         {
           "queryScope": "COLLECTION_GROUP",

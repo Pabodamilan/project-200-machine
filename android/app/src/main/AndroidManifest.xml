@@ -17,6 +17,19 @@
          declared for when a true background daily check is added later. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+    <!-- Vehicle Inspection Photos/Voice Notes (_InspectionAttachmentsSection)
+         — RECORD_AUDIO for the `record` package's mic capture; the media
+         permissions are declared for file_picker/image_picker's older,
+         non-Photo-Picker code paths (the modern Android 13+ Photo Picker
+         image_picker normally uses needs no permission at all, but these
+         are harmless if unused and needed on pre-13 devices/fallbacks).
+         INTERNET is already implicitly granted via a merged plugin
+         manifest (firebase_core et al.), declared here too for clarity. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="NODA Civimech Engineering"
         android:name="${applicationName}"
