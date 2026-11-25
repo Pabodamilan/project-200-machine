@@ -153,7 +153,14 @@ void main() {
     }
     expect(find.textContaining('Last seen'), findsOneWidget); // LM-6435
     expect(find.textContaining('No recent position · last seen'), findsOneWidget); // HT-04
-    expect(find.text('No recent position'), findsOneWidget); // LO-2168
+    // LO-2168 (scoped to its row: bike rows now carry the same status text).
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('speed-truck-t3')),
+        matching: find.text('No recent position'),
+      ),
+      findsOneWidget,
+    );
     expect(find.text('No GPS device'), findsOneWidget);
     expect(find.text('GPS device not found in Traccar'), findsOneWidget);
     expect(tester.widget<ListTile>(find.byKey(const ValueKey('speed-truck-t1'))).enabled, isTrue);

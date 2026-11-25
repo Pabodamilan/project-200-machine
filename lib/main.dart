@@ -67205,6 +67205,46 @@ List<SpeedPickerTruckRow> buildSpeedPickerTruckRows({
   return rows;
 }
 
+// ---- Vehicle Speed picker: bike rows ----
+// Same statuses/rules as the truck rows above (so a bike with no GPS
+// Device ID, or one Traccar doesn't know, is listed greyed instead of
+// hidden or failing later). A bike doc that is really a truck (its GPS
+// Device ID / number is on a truck — LiveVehicleIndex) is left out, as
+// before: it is already listed under Trucks. The row's truckNumber field
+// holds the bike number (the row type is shared with trucks).
+List<SpeedPickerTruckRow> buildSpeedPickerBikeRows({
+  required List<({String id, Map<String, dynamic> data})> bikes,
+  required List<Map<String, dynamic>> devices,
+  required LiveVehicleIndex index,
+}) {
+  final real = [
+    for (final b in bikes)
+      if (!index.bikeDocIsReallyTruck(b.data)) b,
+  ];
+  // buildSpeedPickerTruckRows only reads 'truckNumber'/'gpsDeviceId'.
+  return buildSpeedPickerTruckRows(
+    trucks: [
+      for (final b in real)
+        (
+          id: b.id,
+          data: {
+            'truckNumber': b.data['bikeNumber'],
+            'gpsDeviceId': b.data['gpsDeviceId'],
+          },
+        ),
+    ],
+    devices: devices,
+  );
+}
+
+enum SpeedPickerTypeFilter { all, trucks, bikes }
+
+// Search is a case-insensitive "contains" on the vehicle number.
+bool speedPickerRowMatchesSearch(SpeedPickerTruckRow r, String query) {
+  final q = query.trim().toUpperCase();
+  return q.isEmpty || r.truckNumber.toUpperCase().contains(q);
+}
+
 String speedPickerTruckSubtitle(SpeedPickerTruckRow r, {DateTime? now}) {
   switch (r.status) {
     case SpeedPickerTruckStatus.noGpsDevice:
@@ -67296,6 +67336,18 @@ class _SpeedVehiclePickerState extends State<SpeedVehiclePicker> {
       ReferenceCollectionCache.stream(kBikesCollection, db: widget.firestoreOverride);
   late Future<List<Map<String, dynamic>>> _devicesFuture = _loadDevices();
   String? _lastLogKey;
+
+  // All | Trucks | Bikes filter + number search. Plain State fields: they
+  // last only while the picker is open (never persisted).
+  SpeedPickerTypeFilter _typeFilter = SpeedPickerTypeFilter.all;
+  final TextEditingController _searchController = TextEditingController();
+  String _search = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
 
   QueryDocumentSnapshot? _selectedVehicle;
   bool _selectedIsBike = false;
@@ -67559,18 +67611,19 @@ class _SpeedVehiclePickerState extends State<SpeedVehiclePicker> {
       trucks: truckDocs.map((d) => d.data()),
       bikes: bikeDocs.map((d) => d.data()),
     );
-    final bikes = bikeDocs.where((doc) {
-      final data = doc.data();
-      final id = (data['gpsDeviceId'] ?? '').toString();
-      return id.trim().isNotEmpty && !index.bikeDocIsReallyTruck(data);
-    }).toList()
-      ..sort((a, b) => normalizeVehicleNumber((a.data()['bikeNumber'] ?? '').toString())
-          .compareTo(normalizeVehicleNumber((b.data()['bikeNumber'] ?? '').toString())));
+    final bikeDocById = {for (final d in bikeDocs) d.id: d};
+    final bikeRows = buildSpeedPickerBikeRows(
+      bikes: [for (final d in bikeDocs) (id: d.id, data: d.data())],
+      devices: devices,
+      index: index,
+    );
     if (shouldLog && kDebugMode) {
-      debugPrint('[SPEED_PICKER] bikes loaded=${bikeDocs.length} listed=${bikes.length} '
-          '(duplicates of a truck or without GPS Device ID are not listed)');
+      final selectable = bikeRows.where((r) => r.selectable).length;
+      debugPrint('[SPEED_PICKER] bikes loaded=${bikeDocs.length} '
+          'listed=${bikeRows.length} selectable=$selectable '
+          '(duplicates of a truck are not listed)');
     }
-    if (truckRows.isEmpty && bikes.isEmpty) {
+    if (truckRows.isEmpty && bikeRows.isEmpty) {
       return const Padding(
         key: ValueKey('speed-picker-empty'),
         padding: EdgeInsets.all(12),
@@ -67580,45 +67633,138 @@ class _SpeedVehiclePickerState extends State<SpeedVehiclePicker> {
         ),
       );
     }
-    return ListView(
+
+    final showTrucks = _typeFilter != SpeedPickerTypeFilter.bikes;
+    final showBikes = _typeFilter != SpeedPickerTypeFilter.trucks;
+    final trucksShown = showTrucks
+        ? truckRows.where((r) => speedPickerRowMatchesSearch(r, _search)).toList()
+        : const <SpeedPickerTruckRow>[];
+    final bikesShown = showBikes
+        ? bikeRows.where((r) => speedPickerRowMatchesSearch(r, _search)).toList()
+        : const <SpeedPickerTruckRow>[];
+
+    Widget typeChip(SpeedPickerTypeFilter f, String label, int count) =>
+        Padding(
+          padding: const EdgeInsets.only(right: 6),
+          child: ChoiceChip(
+            key: ValueKey('speed-filter-${f.name}'),
+            label: Text('$label ($count)'),
+            selected: _typeFilter == f,
+            onSelected: (_) => setState(() => _typeFilter = f),
+          ),
+        );
+
+    Widget typeLabel(String text) => Text(
+          text,
+          style: TextStyle(fontSize: 10, color: Colors.grey[700]),
+        );
+
+    Widget emptyMessage() {
+      final String text;
+      final String key;
+      if (_search.trim().isNotEmpty) {
+        text = 'No vehicles match "${_search.trim()}".';
+        key = 'speed-picker-no-match';
+      } else if (_typeFilter == SpeedPickerTypeFilter.bikes) {
+        text = 'No bikes found';
+        key = 'speed-picker-no-bikes';
+      } else {
+        text = 'No trucks found';
+        key = 'speed-picker-no-trucks';
+      }
+      return Padding(
+        key: ValueKey(key),
+        padding: const EdgeInsets.all(12),
+        child: Text(text, style: const TextStyle(fontSize: 12)),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (truckRows.isNotEmpty) ...[
-          _sectionHeader('Trucks'),
-          ...truckRows.map((r) {
-            final doc = truckDocById[r.docId]!;
-            return Opacity(
-              opacity: r.selectable ? 1 : 0.45,
-              child: ListTile(
-                key: ValueKey('speed-truck-${r.docId}'),
-                dense: true,
-                enabled: r.selectable,
-                leading: const LiveVehicleIcon(
-                  key: ValueKey('live-icon-truck'),
-                  type: LiveVehicleType.truck,
+        // Wrap (not a horizontal list) so all three chips stay visible on
+        // a narrow phone instead of the last one sliding off-screen.
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Wrap(
+            runSpacing: 4,
+            children: [
+              typeChip(SpeedPickerTypeFilter.all, 'All',
+                  truckRows.length + bikeRows.length),
+              typeChip(SpeedPickerTypeFilter.trucks, 'Trucks', truckRows.length),
+              typeChip(SpeedPickerTypeFilter.bikes, 'Bikes', bikeRows.length),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+          child: TextField(
+            key: const ValueKey('speed-picker-search'),
+            controller: _searchController,
+            onChanged: (v) => setState(() => _search = v),
+            decoration: const InputDecoration(
+              isDense: true,
+              prefixIcon: Icon(Icons.search, size: 18),
+              hintText: 'Search vehicle number',
+            ),
+          ),
+        ),
+        Expanded(
+          child: trucksShown.isEmpty && bikesShown.isEmpty
+              ? emptyMessage()
+              : ListView(
+                  children: [
+                    if (trucksShown.isNotEmpty) ...[
+                      _sectionHeader('Trucks'),
+                      ...trucksShown.map((r) {
+                        final doc = truckDocById[r.docId]!;
+                        return Opacity(
+                          opacity: r.selectable ? 1 : 0.45,
+                          child: ListTile(
+                            key: ValueKey('speed-truck-${r.docId}'),
+                            dense: true,
+                            enabled: r.selectable,
+                            leading: const LiveVehicleIcon(
+                              key: ValueKey('live-icon-truck'),
+                              type: LiveVehicleType.truck,
+                            ),
+                            title: Text(r.truckNumber),
+                            subtitle: Text(speedPickerTruckSubtitle(r)),
+                            trailing: typeLabel('Truck'),
+                            onTap: r.selectable
+                                ? () => _selectVehicle(doc, false)
+                                : null,
+                          ),
+                        );
+                      }),
+                    ],
+                    if (bikesShown.isNotEmpty) ...[
+                      _sectionHeader('Bikes'),
+                      ...bikesShown.map((r) {
+                        final doc = bikeDocById[r.docId]!;
+                        return Opacity(
+                          opacity: r.selectable ? 1 : 0.45,
+                          child: ListTile(
+                            key: ValueKey('speed-bike-${r.docId}'),
+                            dense: true,
+                            enabled: r.selectable,
+                            leading: const LiveVehicleIcon(
+                              key: ValueKey('live-icon-bike'),
+                              type: LiveVehicleType.bike,
+                            ),
+                            title: Text(r.truckNumber),
+                            subtitle: Text(speedPickerTruckSubtitle(r)),
+                            trailing: typeLabel('Bike'),
+                            onTap: r.selectable
+                                ? () => _selectVehicle(doc, true)
+                                : null,
+                          ),
+                        );
+                      }),
+                    ],
+                  ],
                 ),
-                title: Text(r.truckNumber),
-                subtitle: Text(speedPickerTruckSubtitle(r)),
-                onTap: r.selectable ? () => _selectVehicle(doc, false) : null,
-              ),
-            );
-          }),
-        ],
-        if (bikes.isNotEmpty) ...[
-          _sectionHeader('Bikes'),
-          ...bikes.map((doc) {
-            final data = doc.data();
-            return ListTile(
-              key: ValueKey('speed-bike-${doc.id}'),
-              dense: true,
-              leading: const LiveVehicleIcon(
-                key: ValueKey('live-icon-bike'),
-                type: LiveVehicleType.bike,
-              ),
-              title: Text((data['bikeNumber'] ?? '').toString()),
-              onTap: () => _selectVehicle(doc, true),
-            );
-          }),
-        ],
+        ),
       ],
     );
   }
