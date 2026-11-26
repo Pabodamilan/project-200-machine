@@ -117,7 +117,7 @@ void main() {
       (tester) async {
         await setSurface(tester, size);
         final firestore = await fixtureBase();
-        await firestore.collection('trucks').doc('t1').set({'truckNumber': 'WP-1111'});
+        await firestore.collection('trucks').doc('t1').set({'truckNumber': 'WP-1111', 'isCompanyTruck': true});
         await firestore.collection('service_items').doc('sched1').set({
           'name': sixtyCharServiceName,
           'intervalKm': 10000,
@@ -148,10 +148,12 @@ void main() {
         await settle(tester);
         expect(tester.takeException(), isNull);
 
-        expect(find.text('SERVICE'), findsOneWidget);
+        expect(find.text('SERVICE (1)'), findsOneWidget);
         expect(find.text('WP-1111'), findsOneWidget);
         expect(find.textContaining(sixtyCharServiceName), findsOneWidget);
-        expect(find.textContaining('OVERDUE'), findsOneWidget);
+        // The row's status chip ('OVERDUE BY n km'); the card's fleet
+        // summary row also has a plain 'OVERDUE' count tile now.
+        expect(find.textContaining('OVERDUE BY'), findsOneWidget);
         expect(find.widgetWithText(ElevatedButton, 'DO SERVICE'), findsOneWidget);
       },
     );
@@ -162,7 +164,7 @@ void main() {
       (tester) async {
         await setSurface(tester, size);
         final firestore = await fixtureBase();
-        await firestore.collection('trucks').doc('t1').set({'truckNumber': 'WP-2222'});
+        await firestore.collection('trucks').doc('t1').set({'truckNumber': 'WP-2222', 'isCompanyTruck': true});
         await firestore.collection('service_items').doc('sched1').set({
           'name': 'Oil Change',
           'intervalKm': 10000,
@@ -205,7 +207,7 @@ void main() {
       (tester) async {
         await setSurface(tester, size);
         final firestore = await fixtureBase();
-        await firestore.collection('trucks').doc('t1').set({'truckNumber': 'WP-3333'});
+        await firestore.collection('trucks').doc('t1').set({'truckNumber': 'WP-3333', 'isCompanyTruck': true});
         await firestore.collection('service_items').doc('sched1').set({
           'name': 'Oil Change',
           'intervalKm': 10000,

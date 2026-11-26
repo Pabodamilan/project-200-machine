@@ -15,9 +15,64 @@
 // passively through ThemeData, since most widgets here don't hardcode
 // colors that would override that.
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
+
+// ---------------- ANDROID PHONE COMPACT UI ----------------
+// The Android app rendered text/icons/padding noticeably larger than the
+// web build. These knobs shrink them on Android ONLY (never web, never
+// iOS/desktop), applied globally — MyApp's builder (text scale) and
+// AppTheme.light() (density, icon size, ListTile/AppCard padding) — so no
+// per-screen edits are needed. Adjust here.
+//
+// Text multiplier on Android. Applied as a MediaQuery textScaler so it
+// also reaches the ~370 hard-coded `fontSize:` styles (a textTheme scale
+// would not).
+const double kMobileUiScale = 0.9;
+// The user's system font-size setting is honoured up to this factor
+// before kMobileUiScale is applied (bigger accessibility sizes are capped).
+const double kMobileMaxSystemTextScale = 1.0;
+// Default size for icons that don't set their own (Material default 24).
+const double kMobileIconSize = 20;
+// AppCard's default inner padding on Android (web keeps AppSpacing.lg).
+const double kMobileCardPadding = AppSpacing.md;
+
+// True only for the Android app (not web — kIsWeb is also true for the
+// web build opened in an Android browser). Params exist for tests.
+bool isCompactMobileUi({bool? isWeb, TargetPlatform? platform}) =>
+    !(isWeb ?? kIsWeb) && (platform ?? defaultTargetPlatform) == TargetPlatform.android;
+
+// System scale clamped to kMobileMaxSystemTextScale, then x kMobileUiScale.
+TextScaler compactMobileTextScaler(TextScaler system) {
+  final clamped = system.clamp(maxScaleFactor: kMobileMaxSystemTextScale);
+  return TextScaler.linear(clamped.scale(100) / 100 * kMobileUiScale);
+}
+
+// Wraps the whole app (MaterialApp.builder). No-op off Android.
+class MobileUiScale extends StatelessWidget {
+  final Widget child;
+  final bool? isWebOverride;
+  final TargetPlatform? platformOverride;
+  const MobileUiScale({
+    super.key,
+    required this.child,
+    this.isWebOverride,
+    this.platformOverride,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!isCompactMobileUi(isWeb: isWebOverride, platform: platformOverride)) {
+      return child;
+    }
+    final mq = MediaQuery.of(context);
+    return MediaQuery(
+      data: mq.copyWith(textScaler: compactMobileTextScaler(mq.textScaler)),
+      child: child,
+    );
+  }
+}
 
 // ---------------- DESIGN TOKENS ----------------
 
@@ -288,6 +343,16 @@ class AppCard extends StatefulWidget {
 class _AppCardState extends State<AppCard> {
   double _scale = 1.0;
 
+  // Default padding shrinks to kMobileCardPadding under the compact
+  // (Android) theme; an explicitly passed padding is always respected.
+  EdgeInsetsGeometry _effectivePadding(BuildContext context) {
+    if (widget.padding == const EdgeInsets.all(AppSpacing.lg) &&
+        Theme.of(context).visualDensity == VisualDensity.compact) {
+      return const EdgeInsets.all(kMobileCardPadding);
+    }
+    return widget.padding;
+  }
+
   void _setPressed(bool pressed) {
     if (widget.onTap == null) return;
     if (MediaQuery.of(context).disableAnimations) return;
@@ -315,7 +380,7 @@ class _AppCardState extends State<AppCard> {
               onTapDown: (_) => _setPressed(true),
               onTapUp: (_) => _setPressed(false),
               onTapCancel: () => _setPressed(false),
-              child: Padding(padding: widget.padding, child: widget.child),
+              child: Padding(padding: _effectivePadding(context), child: widget.child),
             ),
           ),
         ),

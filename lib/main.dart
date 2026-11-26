@@ -173,6 +173,8 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       scrollBehavior: AppScrollBehavior(),
+      // Android-only compact text scale (see kMobileUiScale); no-op on web.
+      builder: (context, child) => MobileUiScale(child: child ?? const SizedBox.shrink()),
       home: _isAccountDeletionRoute
           ? const AccountDeletionScreen()
           : AuthGate(key: UniqueKey()),
@@ -345,6 +347,11 @@ class _AuthGateState extends State<AuthGate> {
             // resolveUserLandingKind) — a technical account always has
             // both flags true by default but lands on the richer
             // TechnicalHomeScreen, never the old two-tile dashboard.
+            // Supervisors: Site + whichever of Fuel/Garage/Warehouse they
+            // already have, via SupervisorHome (chooser only when >1).
+            if (role == 'supervisor') {
+              return SupervisorHome(name: name, userData: data, uid: user.uid);
+            }
             final landingKind = resolveUserLandingKind(
               role: role,
               canAccessGarage: data['canAccessGarage'] == true,
@@ -367,9 +374,8 @@ class _AuthGateState extends State<AuthGate> {
               case 'owner':
                 return OwnerDashboard(name: name);
               case 'supervisor':
-                return data['canAccessFuel'] == true
-                    ? SupervisorChoiceScreen(name: name)
-                    : SupervisorScreen(name: name);
+                // Unreachable — handled by SupervisorHome above.
+                return SupervisorHome(name: name, userData: data, uid: user.uid);
               case 'driver':
                 // Drivers only do the Daily Check (no Machines, no work entry).
                 return DriverHomeScreen(name: name);
@@ -1374,9 +1380,11 @@ class _LoginScreenState extends State<LoginScreen> {
           target = OwnerDashboard(name: name);
           break;
         case 'supervisor':
-          target = userDoc.data()?['canAccessFuel'] == true
-              ? SupervisorChoiceScreen(name: name)
-              : SupervisorScreen(name: name);
+          target = SupervisorHome(
+            name: name,
+            userData: userDoc.data(),
+            uid: userDoc.id,
+          );
           break;
         case 'driver':
           // Drivers only do the Daily Check (no Machines, no work entry).
@@ -1781,6 +1789,25 @@ class AdminDashboard extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           _WebStaggeredFadeIn(
+            index: 5,
+            child: _buildMenuCard(
+              context,
+              icon: Icons.fact_check_outlined,
+              title: 'Truck Ownership',
+              subtitle: 'Set each truck Company or Private',
+              color: Colors.deepOrange,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const TruckOwnershipScreen(),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+          _WebStaggeredFadeIn(
             index: 6,
             child: _buildMenuCard(
               context,
@@ -2079,6 +2106,14 @@ class AdminDashboard extends StatelessWidget {
             onTap: () => Navigator.push(
               context,
               FadeSlideRoute(page: const TruckManagementScreen()),
+            ),
+          ),
+          WebSidebarItem(
+            icon: Icons.fact_check_outlined,
+            label: 'Truck Ownership',
+            onTap: () => Navigator.push(
+              context,
+              FadeSlideRoute(page: const TruckOwnershipScreen()),
             ),
           ),
           WebSidebarItem(
@@ -20119,13 +20154,220 @@ class _DashboardTopBarState extends State<_DashboardTopBar> {
   }
 }
 
-// ---------------- SUPERVISOR CHOICE SCREEN (Work / Fuel) ----------------
-// Only shown to supervisors whose user doc has canAccessFuel == true (see
-// AuthGate and LoginScreen's post-login routing). Everyone else goes
-// straight to SupervisorScreen, unchanged.
+// ---------------- SUPERVISOR HOME (Site / Fuel / Garage / Warehouse) ------
+// A supervisor's destinations are ONLY the accesses their user doc already
+// grants — nothing is unlocked here:
+//   SITE      always (the supervisor role's own SupervisorScreen)
+//   FUEL      canAccessFuel == true
+//   GARAGE    canAccessGarage == true
+//   WAREHOUSE canAccessWarehouse == true
+// There is no "Admin" destination: no field or flag gives a supervisor any
+// admin screen (role is a single string), so offering one would loosen
+// permissions. One destination -> straight there, no chooser. Several ->
+// SupervisorChoiceScreen, the choice remembered per uid in
+// SharedPreferences, and a Switch button (SupervisorSwitchButton) on each
+// destination's header to go back to the chooser.
+//
+// Before this, AuthGate sent a supervisor with Garage/Warehouse access ONLY
+// to Garage/Warehouse (resolveUserLandingKind's override) — the Site screen
+// was unreachable — while LoginScreen's direct routing ignored those flags
+// and opened SupervisorScreen, so the landing screen depended on whether
+// the app was cold-started or freshly logged in.
+class SupervisorDestination {
+  static const site = 'SITE';
+  static const fuel = 'FUEL';
+  static const garage = 'GARAGE';
+  static const warehouse = 'WAREHOUSE';
+}
+
+List<String> resolveSupervisorDestinations(Map<String, dynamic>? userData) => [
+      SupervisorDestination.site,
+      if (userData?['canAccessFuel'] == true) SupervisorDestination.fuel,
+      if (userData?['canAccessGarage'] == true) SupervisorDestination.garage,
+      if (userData?['canAccessWarehouse'] == true) SupervisorDestination.warehouse,
+    ];
+
+String supervisorHomeChoicePrefKey(String uid) => 'supervisorHomeChoice.$uid';
+
+// Lets a destination screen's header show a Switch button only when it is
+// hosted by SupervisorHome with more than one destination.
+class SupervisorSwitchScope extends InheritedWidget {
+  final VoidCallback onSwitch;
+  const SupervisorSwitchScope({super.key, required this.onSwitch, required super.child});
+
+  static SupervisorSwitchScope? maybeOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<SupervisorSwitchScope>();
+
+  @override
+  bool updateShouldNotify(SupervisorSwitchScope oldWidget) => onSwitch != oldWidget.onSwitch;
+}
+
+// Renders nothing unless inside a SupervisorSwitchScope.
+class SupervisorSwitchButton extends StatelessWidget {
+  final Color color;
+  const SupervisorSwitchButton({super.key, this.color = Colors.white});
+
+  @override
+  Widget build(BuildContext context) {
+    final scope = SupervisorSwitchScope.maybeOf(context);
+    if (scope == null) return const SizedBox.shrink();
+    return IconButton(
+      key: const ValueKey('supervisor-switch'),
+      tooltip: 'Switch',
+      icon: Icon(Icons.swap_horiz, color: color),
+      onPressed: scope.onSwitch,
+    );
+  }
+}
+
+class SupervisorHome extends StatefulWidget {
+  final String name;
+  final Map<String, dynamic>? userData;
+  final String? uid;
+  // Test seam: builds a destination instead of the real screen.
+  final Widget Function(String destination)? destinationBuilderOverride;
+  const SupervisorHome({
+    super.key,
+    required this.name,
+    required this.userData,
+    this.uid,
+    this.destinationBuilderOverride,
+  });
+
+  @override
+  State<SupervisorHome> createState() => _SupervisorHomeState();
+}
+
+class _SupervisorHomeState extends State<SupervisorHome> {
+  late final List<String> _destinations = resolveSupervisorDestinations(widget.userData);
+  String? _choice;
+  bool _loadingPref = true;
+
+  String? get _uid => widget.uid ?? FirebaseAuth.instance.currentUser?.uid;
+
+  @override
+  void initState() {
+    super.initState();
+    if (_destinations.length == 1) {
+      _choice = _destinations.single;
+      _loadingPref = false;
+    } else {
+      _loadRemembered();
+    }
+  }
+
+  Future<void> _loadRemembered() async {
+    String? saved;
+    try {
+      final uid = _uid;
+      if (uid != null) {
+        final prefs = await SharedPreferences.getInstance();
+        saved = prefs.getString(supervisorHomeChoicePrefKey(uid));
+      }
+    } catch (e) {
+      debugPrint('SupervisorHome: could not read remembered choice: $e');
+    }
+    if (!mounted) return;
+    setState(() {
+      // A remembered destination whose access was since removed is ignored.
+      _choice = _destinations.contains(saved) ? saved : null;
+      _loadingPref = false;
+    });
+  }
+
+  Future<void> _remember(String? choice) async {
+    try {
+      final uid = _uid;
+      if (uid == null) return;
+      final prefs = await SharedPreferences.getInstance();
+      final key = supervisorHomeChoicePrefKey(uid);
+      if (choice == null) {
+        await prefs.remove(key);
+      } else {
+        await prefs.setString(key, choice);
+      }
+    } catch (e) {
+      debugPrint('SupervisorHome: could not save choice: $e');
+    }
+  }
+
+  void _select(String destination) {
+    setState(() => _choice = destination);
+    _remember(destination);
+  }
+
+  void _switch() {
+    setState(() => _choice = null);
+    _remember(null);
+  }
+
+  Widget _build(String destination) {
+    final override = widget.destinationBuilderOverride;
+    if (override != null) return override(destination);
+    switch (destination) {
+      case SupervisorDestination.fuel:
+        return FuelEntryScreen(supervisorName: widget.name);
+      case SupervisorDestination.garage:
+        return GarageScreen(name: widget.name);
+      case SupervisorDestination.warehouse:
+        return WarehouseScreen(name: widget.name);
+      default:
+        return SupervisorScreen(name: widget.name);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loadingPref) {
+      return Scaffold(
+        body: Container(
+          decoration: const BoxDecoration(gradient: AppTheme.mainGradient),
+          child: const Center(child: CircularProgressIndicator(color: Colors.white)),
+        ),
+      );
+    }
+    final choice = _choice;
+    if (choice == null) {
+      return SupervisorChoiceScreen(
+        name: widget.name,
+        destinations: _destinations,
+        onSelected: _select,
+      );
+    }
+    if (_destinations.length == 1) return _build(choice);
+    return SupervisorSwitchScope(
+      onSwitch: _switch,
+      child: KeyedSubtree(key: ValueKey('supervisor-dest-$choice'), child: _build(choice)),
+    );
+  }
+}
+
+// ---------------- SUPERVISOR CHOICE SCREEN ----------------
+// Shown by SupervisorHome when a supervisor has more than one destination.
+// Lists only `destinations` (already permission-resolved).
 class SupervisorChoiceScreen extends StatelessWidget {
   final String name;
-  const SupervisorChoiceScreen({super.key, required this.name});
+  final List<String> destinations;
+  final ValueChanged<String> onSelected;
+  const SupervisorChoiceScreen({
+    super.key,
+    required this.name,
+    required this.destinations,
+    required this.onSelected,
+  });
+
+  static ({String label, IconData icon}) _meta(String destination) {
+    switch (destination) {
+      case SupervisorDestination.fuel:
+        return (label: 'Fuel Entry', icon: Icons.local_gas_station);
+      case SupervisorDestination.garage:
+        return (label: 'Garage', icon: Icons.garage);
+      case SupervisorDestination.warehouse:
+        return (label: 'Warehouse', icon: Icons.warehouse);
+      default:
+        return (label: 'Site Work', icon: Icons.engineering);
+    }
+  }
 
   Future<void> _logout(BuildContext context) async {
     await FirebaseAuth.instance.signOut();
@@ -20180,7 +20422,7 @@ class SupervisorChoiceScreen extends StatelessWidget {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'What would you like to do today?',
+                            'Choose where to go',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                               fontSize: 14,
@@ -20188,30 +20430,16 @@ class SupervisorChoiceScreen extends StatelessWidget {
                             ),
                           ),
                           const SizedBox(height: 36),
-                          GradientButton(
-                            label: '1. Work',
-                            icon: Icons.engineering,
-                            height: 64,
-                            onTap: () => Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => SupervisorScreen(name: name),
-                              ),
+                          for (var i = 0; i < destinations.length; i++) ...[
+                            if (i > 0) const SizedBox(height: 16),
+                            GradientButton(
+                              key: ValueKey('supervisor-choice-${destinations[i]}'),
+                              label: '${i + 1}. ${_meta(destinations[i]).label}',
+                              icon: _meta(destinations[i]).icon,
+                              height: 64,
+                              onTap: () => onSelected(destinations[i]),
                             ),
-                          ),
-                          const SizedBox(height: 16),
-                          GradientButton(
-                            label: '2. Fuel',
-                            icon: Icons.local_gas_station,
-                            height: 64,
-                            onTap: () => Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) =>
-                                    FuelEntryScreen(supervisorName: name),
-                              ),
-                            ),
-                          ),
+                          ],
                         ],
                       ),
                     ),
@@ -20389,7 +20617,16 @@ class _FuelEntryScreenState extends State<FuelEntryScreen> {
                   children: [
                     IconButton(
                       icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      onPressed: () => Navigator.pop(context),
+                      onPressed: () {
+                        // Hosted as SupervisorHome's root there is nothing
+                        // to pop — go back to the chooser instead.
+                        final scope = SupervisorSwitchScope.maybeOf(context);
+                        if (!Navigator.canPop(context) && scope != null) {
+                          scope.onSwitch();
+                        } else {
+                          Navigator.pop(context);
+                        }
+                      },
                     ),
                     const Expanded(
                       child: Text(
@@ -20996,19 +21233,25 @@ class _SupervisorScreenState extends State<SupervisorScreen> {
                         color: Colors.white,
                       ),
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.logout, color: Colors.white),
-                      onPressed: () async {
-                        await FirebaseAuth.instance.signOut();
-                        if (context.mounted) {
-                          Navigator.pushReplacement(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => const LoginScreen(),
-                            ),
-                          );
-                        }
-                      },
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const SupervisorSwitchButton(),
+                        IconButton(
+                          icon: const Icon(Icons.logout, color: Colors.white),
+                          onPressed: () async {
+                            await FirebaseAuth.instance.signOut();
+                            if (context.mounted) {
+                              Navigator.pushReplacement(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => const LoginScreen(),
+                                ),
+                              );
+                            }
+                          },
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -26204,8 +26447,19 @@ class AppTheme {
   // name, so primaryDark/primaryMid/accent/mainGradient/cardGradient/
   // softShadow above — already used throughout the app (GarageScreen,
   // DashboardMenuCard, etc.) — keep working completely unchanged.
-  static ThemeData light() {
-    final base = ThemeData(useMaterial3: true, brightness: Brightness.light);
+  // `compact` defaults to the Android app only (isCompactMobileUi): denser
+  // VisualDensity, kMobileIconSize default icons, tighter ListTile padding
+  // (AppCard reads the density for its own padding). Web is unchanged.
+  // Touch targets stay >= 40dp: materialTapTargetSize stays padded (48dp)
+  // and the 48dp button minimums only lose the 8dp density step (-> 40).
+  static ThemeData light({bool? compact}) {
+    final isCompact = compact ?? isCompactMobileUi();
+    final base = ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.light,
+      visualDensity: isCompact ? VisualDensity.compact : null,
+      materialTapTargetSize: MaterialTapTargetSize.padded,
+    );
     final textTheme = GoogleFonts.interTextTheme(base.textTheme).apply(
       bodyColor: AppColors.textPrimary,
       displayColor: AppColors.textPrimary,
@@ -26351,7 +26605,15 @@ class AppTheme {
         headingRowColor: WidgetStateProperty.all(AppColors.background),
         dataRowColor: WidgetStateProperty.all(AppColors.card),
       ),
-      listTileTheme: const ListTileThemeData(iconColor: AppColors.textSecondary),
+      listTileTheme: isCompact
+          ? const ListTileThemeData(
+              iconColor: AppColors.textSecondary,
+              contentPadding: EdgeInsets.symmetric(horizontal: AppSpacing.md),
+              horizontalTitleGap: AppSpacing.md,
+              minLeadingWidth: 32,
+            )
+          : const ListTileThemeData(iconColor: AppColors.textSecondary),
+      iconTheme: isCompact ? base.iconTheme.copyWith(size: kMobileIconSize) : null,
       popupMenuTheme: PopupMenuThemeData(
         color: AppColors.card,
         shape: RoundedRectangleBorder(
@@ -31653,6 +31915,121 @@ class _TechnicianDashboardCard extends StatelessWidget {
   }
 }
 
+// ---------------- SERVICE "SUBMITTED" BADGE ----------------
+// The one "a service for this truck is submitted and waiting for
+// management approval" mark — Technical home card rows (Awaiting approval
+// and partially-submitted Needs service rows) and Service Overview rows all
+// use this widget, never their own copy. Icon + text label + teal color
+// (never color alone). Disappears by itself once the record is APPROVED
+// (it is only ever built from SUBMITTED records / AWAITING_APPROVAL).
+const Color kServiceSubmittedColor = Color(0xFF0F766E); // teal-700
+
+const List<String> _kShortMonths = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+// "26 Nov 11:40" (local time).
+String formatSubmittedAt(DateTime t) {
+  final l = t.toLocal();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '${l.day} ${_kShortMonths[l.month - 1]} ${two(l.hour)}:${two(l.minute)}';
+}
+
+// Full: "Submitted 26 Nov 11:40 · Tina" (date/name only when known).
+// With [scheduleName]: "Submitted: 45,000 km Service" (the small badge on a
+// Needs service row whose OTHER schedule is still due).
+String serviceSubmittedBadgeText({
+  DateTime? submittedAt,
+  String? submittedByName,
+  String? scheduleName,
+}) {
+  if (scheduleName != null && scheduleName.isNotEmpty) return 'Submitted: $scheduleName';
+  final parts = <String>[
+    'Submitted',
+    if (submittedAt != null) formatSubmittedAt(submittedAt),
+  ];
+  final name = (submittedByName ?? '').trim();
+  return name.isEmpty ? parts.join(' ') : '${parts.join(' ')} · $name';
+}
+
+// "Service submitted - awaiting approval: WP-1234 · 45,000 km Service" —
+// the snackbar ServiceRecordFormScreen shows right after a submit.
+String serviceSubmittedSnackText({required String vehicleNumber, String? scheduleName}) {
+  final schedule = (scheduleName ?? '').trim();
+  return 'Service submitted - awaiting approval: $vehicleNumber'
+      '${schedule.isEmpty ? '' : ' · $schedule'}';
+}
+
+// Shown by ServiceRecordFormScreen right after a submit (on the messenger
+// taken before it pops, so it stays up on the screen underneath).
+void showServiceSubmittedSnackBar(ScaffoldMessengerState? messenger, String text) {
+  messenger?.showSnackBar(
+    SnackBar(
+      key: const ValueKey('service-submitted-snackbar'),
+      backgroundColor: kServiceSubmittedColor,
+      content: Row(
+        children: [
+          const Icon(Icons.check_circle, color: Colors.white),
+          const SizedBox(width: 8),
+          Expanded(child: Text(text)),
+        ],
+      ),
+    ),
+  );
+}
+
+class ServiceSubmittedBadge extends StatelessWidget {
+  final DateTime? submittedAt;
+  final String? submittedByName;
+  final String? scheduleName;
+  // One line + ellipsis, for fixed-height table cells (Service Overview).
+  final bool singleLine;
+  const ServiceSubmittedBadge({
+    super.key,
+    this.submittedAt,
+    this.submittedByName,
+    this.scheduleName,
+    this.singleLine = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 300),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: kServiceSubmittedColor,
+        borderRadius: BorderRadius.circular(AppRadius.chip),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.check_circle, size: singleLine ? 12 : 14, color: Colors.white),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              serviceSubmittedBadgeText(
+                submittedAt: submittedAt,
+                submittedByName: submittedByName,
+                scheduleName: scheduleName,
+              ),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+              softWrap: !singleLine,
+              maxLines: singleLine ? 1 : null,
+              overflow: singleLine ? TextOverflow.ellipsis : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ---------------- TECHNICAL HOME ----------------
 // Landing screen for the TECHNICAL account type (mechanics/engineers) —
 // see resolveUserLandingKind()/technicalDefaults(). Richer than the old
@@ -31664,9 +32041,12 @@ class _TechnicianDashboardCard extends StatelessWidget {
 // Every destination screen re-checks its own permission regardless (no
 // new bypass is introduced here).
 // 'SERVICE' card shown directly on TechnicalHomeScreen (below the alerts
-// banner, no extra tap needed) — company vehicles that need attention,
-// sorted RED (overdue/missed) -> KM UNKNOWN -> AMBER (due soon) ->
-// AWAITING APPROVAL. Reuses the same ServiceAlertsCache the bell/banner
+// banner, no extra tap needed) — every truck, sorted RED (overdue/missed)
+// -> KM UNKNOWN -> AMBER (due soon) -> AWAITING APPROVAL -> UP TO DATE
+// (buildTechnicalServiceRows); the inline list shows only NEEDS SERVICE by
+// default (status chips switch to Awaiting approval / Up to date / All). Tapping a truck opens
+// the existing service-do flow (ServiceRecordFormScreen) for SERVICE_DO
+// holders, or that truck's service history otherwise. Reuses the same ServiceAlertsCache the bell/banner
 // already populate (per-uid, 5-minute refresh) via
 // _loadAlertsForCurrentUser — pumping this card alongside them costs no
 // extra Firestore read beyond the first. Own future in State (not a
@@ -31687,6 +32067,249 @@ class TechnicalHomeServiceCard extends StatefulWidget {
   State<TechnicalHomeServiceCard> createState() => _TechnicalHomeServiceCardState();
 }
 
+// One row per company truck on the Technical home Service card: the
+// truck's worst service alert (null = nothing due -> UP TO DATE).
+typedef TechnicalServiceRow = ({String vehicleNumber, ServiceAlert? alert});
+
+// Sort rank for the Technical home Service list: OVERDUE/MISSED, then KM
+// UNKNOWN, then DUE SOON, then AWAITING APPROVAL, then UP TO DATE.
+int technicalServiceRowRank(ServiceAlert? a) {
+  if (a == null) return 4;
+  if (a.kind == ServiceAlertKind.serviceAwaitingApproval) return 3;
+  switch (a.severity) {
+    case ServiceAlertSeverity.missed:
+    case ServiceAlertSeverity.overdue:
+      return 0;
+    case ServiceAlertSeverity.kmUnknown:
+      return 1;
+    case ServiceAlertSeverity.dueSoon:
+      return 2;
+    default:
+      return 4;
+  }
+}
+
+// EVERY truck, one row each, worst first: rank, then the most-overdue km
+// first, then truck number. A truck with several alerts keeps only its
+// worst one. A service the technician already SUBMITTED (awaiting
+// management approval) takes the truck out of "needs service": its own
+// schedule already reads OK (computeScheduleStatus' PROVISIONAL
+// override), and a submission with no schedule picked covers that
+// truck's other km/date dues too — only KM UNKNOWN, or a due schedule a
+// submission names but is NOT for, keeps it in "needs service". Pure, so
+// it is unit-tested directly.
+List<TechnicalServiceRow> buildTechnicalServiceRows({
+  required List<String> truckNumbers,
+  required List<ServiceAlert> alerts,
+}) {
+  final dueByVehicle = <String, List<ServiceAlert>>{};
+  final awaitingByVehicle = <String, List<ServiceAlert>>{};
+  for (final a in alerts) {
+    if (a.kind == ServiceAlertKind.serviceDue) {
+      (dueByVehicle[a.vehicleNumber] ??= []).add(a);
+    } else if (a.kind == ServiceAlertKind.serviceAwaitingApproval) {
+      (awaitingByVehicle[a.vehicleNumber] ??= []).add(a);
+    }
+  }
+  final worst = <String, ServiceAlert>{};
+  for (final v in {...dueByVehicle.keys, ...awaitingByVehicle.keys}) {
+    final awaiting = awaitingByVehicle[v] ?? const <ServiceAlert>[];
+    final coversAll = awaiting.any((a) => a.scheduleId == null);
+    final coveredIds = {for (final a in awaiting) ?a.scheduleId};
+    ServiceAlert? pick;
+    for (final a in dueByVehicle[v] ?? const <ServiceAlert>[]) {
+      final covered = a.severity != ServiceAlertSeverity.kmUnknown &&
+          (coversAll || (a.scheduleId != null && coveredIds.contains(a.scheduleId)));
+      if (covered) continue;
+      if (pick == null || technicalServiceRowRank(a) < technicalServiceRowRank(pick)) pick = a;
+    }
+    pick ??= awaiting.isEmpty ? null : awaiting.first;
+    if (pick != null) worst[v] = pick;
+  }
+  final numbers = <String>{
+    ...truckNumbers.where((v) => v.isNotEmpty),
+    ...worst.keys,
+  };
+  final rows = [
+    for (final v in numbers) (vehicleNumber: v, alert: worst[v]),
+  ];
+  rows.sort((x, y) {
+    final r = technicalServiceRowRank(x.alert).compareTo(technicalServiceRowRank(y.alert));
+    if (r != 0) return r;
+    final over = (y.alert?.overByKm ?? 0).compareTo(x.alert?.overByKm ?? 0);
+    if (over != 0) return over;
+    return x.vehicleNumber.compareTo(y.vehicleNumber);
+  });
+  return rows;
+}
+
+// Second filter on the Technical home Service list (beside Company /
+// Private / All). Default NEEDS SERVICE = overdue/missed, KM unknown, due
+// soon; AWAITING APPROVAL = submitted, with management; UP TO DATE =
+// nothing due until the next km/date milestone. Not persisted.
+enum TechnicalServiceStatusFilter { needsService, awaitingApproval, upToDate, all }
+
+TechnicalServiceStatusFilter technicalServiceRowStatus(ServiceAlert? a) {
+  switch (technicalServiceRowRank(a)) {
+    case 0:
+    case 1:
+    case 2:
+      return TechnicalServiceStatusFilter.needsService;
+    case 3:
+      return TechnicalServiceStatusFilter.awaitingApproval;
+    default:
+      return TechnicalServiceStatusFilter.upToDate;
+  }
+}
+
+bool technicalServiceRowMatchesStatus(ServiceAlert? a, TechnicalServiceStatusFilter f) =>
+    f == TechnicalServiceStatusFilter.all || technicalServiceRowStatus(a) == f;
+
+String technicalServiceStatusFilterLabel(TechnicalServiceStatusFilter f) {
+  switch (f) {
+    case TechnicalServiceStatusFilter.needsService:
+      return 'Needs service';
+    case TechnicalServiceStatusFilter.awaitingApproval:
+      return 'Awaiting approval';
+    case TechnicalServiceStatusFilter.upToDate:
+      return 'Up to date';
+    case TechnicalServiceStatusFilter.all:
+      return 'All';
+  }
+}
+
+// Height cap for the card's inline truck list — longer fleets scroll
+// inside the card instead of pushing the home tiles off screen. Smaller
+// on phones (narrower than kTechnicalHomeWideBreakpoint).
+const double kTechnicalHomeServiceListMaxHeight = 440;
+const double kTechnicalHomeServiceListMaxHeightPhone = 320;
+// TechnicalHomeScreen switches to two columns (tiles | Service) at this width.
+const double kTechnicalHomeWideBreakpoint = 900;
+
+// Company vs private (hired/external) truck, from trucks/{id}.isCompanyTruck
+// — the ONE definition the whole app uses (Technical Service card, Truck
+// Ownership screen, truck profile, add-truck form, and the same rule the
+// Garage / Live Tracking / service-vehicle pickers already apply in their
+// `isEqualTo: true` queries): true = COMPANY, false = PRIVATE, field
+// missing (or not a bool) = NOT SET. A not-set truck is never counted as
+// company — the admin sets it on the Truck Ownership screen.
+enum TruckOwnership { company, private, notSet }
+
+TruckOwnership truckOwnership(Map<String, dynamic>? truck) {
+  final v = truck?['isCompanyTruck'];
+  if (v == true) return TruckOwnership.company;
+  if (v == false) return TruckOwnership.private;
+  return TruckOwnership.notSet;
+}
+
+String truckOwnershipLabel(TruckOwnership o) {
+  switch (o) {
+    case TruckOwnership.company:
+      return 'Company';
+    case TruckOwnership.private:
+      return 'Private';
+    case TruckOwnership.notSet:
+      return 'Not set';
+  }
+}
+
+enum TruckOwnershipFilter { company, private, notSet, all }
+
+bool truckMatchesOwnershipFilter(TruckOwnership o, TruckOwnershipFilter f) {
+  switch (f) {
+    case TruckOwnershipFilter.company:
+      return o == TruckOwnership.company;
+    case TruckOwnershipFilter.private:
+      return o == TruckOwnership.private;
+    case TruckOwnershipFilter.notSet:
+      return o == TruckOwnership.notSet;
+    case TruckOwnershipFilter.all:
+      return true;
+  }
+}
+
+String truckOwnershipFilterLabel(TruckOwnershipFilter f) {
+  switch (f) {
+    case TruckOwnershipFilter.company:
+      return 'Company';
+    case TruckOwnershipFilter.private:
+      return 'Private';
+    case TruckOwnershipFilter.notSet:
+      return 'Not set';
+    case TruckOwnershipFilter.all:
+      return 'All';
+  }
+}
+
+// Company / Private choice — the one control the add-truck form, the truck
+// profile and the Truck Ownership screen all use. [value] null = NOT SET
+// (nothing selected). Writes nothing itself; the caller saves
+// trucks/{id}.isCompanyTruck = true/false.
+class TruckOwnershipChoice extends StatelessWidget {
+  final bool? value;
+  final ValueChanged<bool>? onChanged;
+  // Prefix for the two segment label keys: '<prefix>-company' / '-private'.
+  final String keyPrefix;
+  // Text color when shown on a dark card (truck profile); null = theme.
+  final Color? onDarkForeground;
+  const TruckOwnershipChoice({
+    super.key,
+    required this.value,
+    required this.onChanged,
+    this.keyPrefix = 'truck-ownership',
+    this.onDarkForeground,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final fg = onDarkForeground;
+    return SegmentedButton<bool>(
+      emptySelectionAllowed: true,
+      showSelectedIcon: true,
+      selected: value == null ? <bool>{} : {value!},
+      style: fg == null
+          ? null
+          : ButtonStyle(
+              foregroundColor: WidgetStateProperty.resolveWith(
+                (states) => states.contains(WidgetState.selected) ? Colors.black : fg,
+              ),
+              backgroundColor: WidgetStateProperty.resolveWith(
+                (states) => states.contains(WidgetState.selected) ? AppTheme.accent : null,
+              ),
+            ),
+      onSelectionChanged: onChanged == null
+          ? null
+          : (sel) {
+              if (sel.isNotEmpty) onChanged!(sel.first);
+            },
+      segments: [
+        ButtonSegment<bool>(
+          value: true,
+          icon: const Icon(Icons.business, size: 16),
+          label: Text('Company', key: ValueKey('$keyPrefix-company')),
+        ),
+        ButtonSegment<bool>(
+          value: false,
+          icon: const Icon(Icons.handshake_outlined, size: 16),
+          label: Text('Private', key: ValueKey('$keyPrefix-private')),
+        ),
+      ],
+    );
+  }
+}
+
+// trucks/{id}.isCompanyTruck as the bool? TruckOwnershipChoice takes.
+bool? truckOwnershipChoiceValue(Map<String, dynamic>? truck) {
+  switch (truckOwnership(truck)) {
+    case TruckOwnership.company:
+      return true;
+    case TruckOwnership.private:
+      return false;
+    case TruckOwnership.notSet:
+      return null;
+  }
+}
+
 class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
   FirebaseFirestore get _db => widget.firestoreOverride ?? FirebaseFirestore.instance;
   String? get _uid => widget.currentUidOverride ?? FirebaseAuth.instance.currentUser?.uid;
@@ -31695,7 +32318,31 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
   Object? _loadError;
   bool _qualifies = false;
   bool _canDoService = false;
-  List<ServiceAlert> _rows = const [];
+  List<TechnicalServiceRow> _rows = const [];
+  // vehicleNumber -> ownership (truckOwnership). Rows not in the trucks
+  // collection (alert-only) are NOT SET, same as a missing field.
+  Map<String, TruckOwnership> _ownershipByVehicle = const {};
+  // vehicleNumber -> its SUBMITTED (awaiting approval) service_records,
+  // newest first — drives the Submitted badges on the rows.
+  Map<String, List<Map<String, dynamic>>> _submittedByVehicle = const {};
+  // Lives only while this card is mounted — deliberately not persisted.
+  TruckOwnershipFilter _ownership = TruckOwnershipFilter.company;
+  // Status filter for the inline list only (header, summary counts and
+  // VIEW ALL keep following the ownership filter). Not persisted either.
+  TechnicalServiceStatusFilter _status = TechnicalServiceStatusFilter.needsService;
+  bool _expanded = true;
+  final _listScroll = ScrollController();
+
+  TruckOwnership _ownershipOf(String vehicleNumber) =>
+      _ownershipByVehicle[vehicleNumber] ?? TruckOwnership.notSet;
+
+  List<TechnicalServiceRow> _rowsFor(TruckOwnershipFilter f) => _rows
+      .where((r) => truckMatchesOwnershipFilter(_ownershipOf(r.vehicleNumber), f))
+      .toList();
+
+  List<TechnicalServiceRow> _listRowsFor(TechnicalServiceStatusFilter f) => _rowsFor(_ownership)
+      .where((r) => technicalServiceRowMatchesStatus(r.alert, f))
+      .toList();
 
   @override
   void initState() {
@@ -31703,20 +32350,10 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
     _load();
   }
 
-  // RED, then KM UNKNOWN, then AMBER, then AWAITING APPROVAL last.
-  int _rank(ServiceAlert a) {
-    if (a.kind == ServiceAlertKind.serviceAwaitingApproval) return 3;
-    switch (a.severity) {
-      case ServiceAlertSeverity.missed:
-      case ServiceAlertSeverity.overdue:
-        return 0;
-      case ServiceAlertSeverity.kmUnknown:
-        return 1;
-      case ServiceAlertSeverity.dueSoon:
-        return 2;
-      default:
-        return 4;
-    }
+  @override
+  void dispose() {
+    _listScroll.dispose();
+    super.dispose();
   }
 
   Future<void> _load({bool forceRefresh = false}) async {
@@ -31730,17 +32367,54 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
         uid: _uid,
         forceRefresh: forceRefresh,
       );
-      final rows = result.alerts
-          .where((a) =>
-              a.kind == ServiceAlertKind.serviceDue ||
-              a.kind == ServiceAlertKind.serviceAwaitingApproval)
-          .toList()
-        ..sort((a, b) => _rank(a).compareTo(_rank(b)));
+      var truckNumbers = const <String>[];
+      final ownershipByVehicle = <String, TruckOwnership>{};
+      if (result.qualifies) {
+        // Same unfiltered trucks read as fetchServiceAlertsData and the
+        // fleet summary counts — every truck, none hidden; the ownership
+        // filter is applied on screen only.
+        final trucksSnap = await _db.collection('trucks').get();
+        truckNumbers = [
+          for (final d in trucksSnap.docs) (d.data()['truckNumber'] ?? '').toString(),
+        ];
+        for (final d in trucksSnap.docs) {
+          final n = (d.data()['truckNumber'] ?? '').toString();
+          if (n.isNotEmpty) ownershipByVehicle[n] = truckOwnership(d.data());
+        }
+      }
+      // "Awaiting approval" from the SUBMITTED records the same cached
+      // fetch already read — the audience-gated awaiting alert is never
+      // built for a viewer who also holds SERVICE_VIEW (the technical
+      // preset does), so it can't be relied on here.
+      final hasAwaiting =
+          result.alerts.any((a) => a.kind == ServiceAlertKind.serviceAwaitingApproval);
+      final submitted = ServiceAlertsCache.peek(_uid ?? 'anon')?.submittedRecords ?? const [];
+      final submittedByVehicle = <String, List<Map<String, dynamic>>>{};
+      for (final r in submitted) {
+        if ((r['status'] ?? '').toString() != ServiceRecordStatus.submitted) continue;
+        final v = (r['vehicleNumber'] ?? '').toString();
+        if (v.isEmpty) continue;
+        (submittedByVehicle[v] ??= []).add(r);
+      }
+      DateTime at(Map<String, dynamic> r) =>
+          (r['submittedAt'] as DateTime?) ?? DateTime.fromMillisecondsSinceEpoch(0);
+      for (final list in submittedByVehicle.values) {
+        list.sort((x, y) => at(y).compareTo(at(x)));
+      }
+      final rows = buildTechnicalServiceRows(
+        truckNumbers: truckNumbers,
+        alerts: [
+          ...result.alerts,
+          if (!hasAwaiting) ...serviceAwaitingApprovalAlerts(submitted),
+        ],
+      );
       if (mounted) {
         setState(() {
           _qualifies = result.qualifies;
           _canDoService = result.canDoService;
           _rows = rows;
+          _ownershipByVehicle = ownershipByVehicle;
+          _submittedByVehicle = submittedByVehicle;
           _loading = false;
         });
       }
@@ -31754,7 +32428,8 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
     }
   }
 
-  String _statusLabel(ServiceAlert a) {
+  String _statusLabel(ServiceAlert? a) {
+    if (a == null) return 'UP TO DATE';
     if (a.kind == ServiceAlertKind.serviceAwaitingApproval) return 'AWAITING APPROVAL';
     switch (a.severity) {
       case ServiceAlertSeverity.missed:
@@ -31769,11 +32444,12 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
             ? 'DUE IN ${(a.dueKm! - a.currentKm!).toStringAsFixed(0)} km'
             : 'DUE SOON';
       default:
-        return 'GREEN';
+        return 'UP TO DATE';
     }
   }
 
-  Color _statusColor(ServiceAlert a) {
+  Color _statusColor(ServiceAlert? a) {
+    if (a == null) return AppColors.success;
     if (a.kind == ServiceAlertKind.serviceAwaitingApproval) return AppColors.textMuted;
     switch (a.severity) {
       case ServiceAlertSeverity.missed:
@@ -31788,9 +32464,51 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
     }
   }
 
-  Widget? _primaryButton(ServiceAlert a) {
-    // AWAITING APPROVAL has nothing left for the technician to do — it's
-    // with management now.
+  // Row tap: SERVICE_DO -> the existing service-do flow
+  // (ServiceRecordFormScreen, schedule preselected when the row has a due
+  // schedule); without SERVICE_DO -> that truck's service history (view
+  // only). No new permission is granted here — the form re-checks
+  // SERVICE_DO itself.
+  void _openTruck(TechnicalServiceRow row) {
+    if (_canDoService) {
+      final a = row.alert;
+      _openServiceForm(
+        row.vehicleNumber,
+        a?.kind == ServiceAlertKind.serviceDue ? a?.scheduleId : null,
+      );
+    } else {
+      pushWebAware(
+        context,
+        VehicleServiceHistoryScreen(
+          vehicleNumber: row.vehicleNumber,
+          firestoreOverride: widget.firestoreOverride,
+          currentUidOverride: widget.currentUidOverride,
+        ),
+      );
+    }
+  }
+
+  // Same route as pushWebAware, but awaited: back on the home card the
+  // list is re-read straight away, so a truck just submitted leaves
+  // "Needs service" at once instead of after the 5-minute cache.
+  Future<void> _openServiceForm(String vehicleNumber, String? scheduleId) async {
+    final page = ServiceRecordFormScreen(
+      vehicleNumber: vehicleNumber,
+      preselectScheduleId: scheduleId,
+      firestoreOverride: widget.firestoreOverride,
+      currentUidOverride: widget.currentUidOverride,
+    );
+    await Navigator.push(
+      context,
+      kIsWeb ? FadeSlideRoute(page: page) : MaterialPageRoute(builder: (_) => page),
+    );
+    if (mounted) await _load(forceRefresh: true);
+  }
+
+  Widget? _primaryButton(ServiceAlert? a) {
+    // UP TO DATE: the row tap still opens the form (nothing urgent, so no
+    // button). AWAITING APPROVAL is with management now.
+    if (a == null) return null;
     if (a.kind == ServiceAlertKind.serviceAwaitingApproval) return null;
     if (!_canDoService) return null;
     if (a.severity == ServiceAlertSeverity.kmUnknown) {
@@ -31808,64 +32526,98 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
       );
     }
     return ElevatedButton(
-      onPressed: () => pushWebAware(
-        context,
-        ServiceRecordFormScreen(
-          vehicleNumber: a.vehicleNumber,
-          preselectScheduleId: a.scheduleId,
-          firestoreOverride: widget.firestoreOverride,
-          currentUidOverride: widget.currentUidOverride,
-        ),
-      ),
+      onPressed: () => _openServiceForm(a.vehicleNumber, a.scheduleId),
       child: const Text('DO SERVICE', softWrap: true),
     );
   }
 
-  Widget _row(ServiceAlert a) {
+  // Submitted badges for one row (shared ServiceSubmittedBadge): an
+  // Awaiting approval row gets the full "Submitted <date> · <name>" badge;
+  // a Needs service row whose truck has a submission for ANOTHER schedule
+  // gets a small "Submitted: <schedule>" per submitted schedule, while its
+  // still-due schedule keeps its own status chip.
+  List<Widget> _submittedBadges(TechnicalServiceRow row) {
+    final records = _submittedByVehicle[row.vehicleNumber] ?? const [];
+    if (records.isEmpty) return const [];
+    final status = technicalServiceRowStatus(row.alert);
+    if (status == TechnicalServiceStatusFilter.awaitingApproval) {
+      final r = records.first;
+      return [
+        ServiceSubmittedBadge(
+          key: ValueKey('technical-service-submitted-${row.vehicleNumber}'),
+          submittedAt: r['submittedAt'] as DateTime?,
+          submittedByName: (r['submittedByName'] ?? '').toString(),
+        ),
+      ];
+    }
+    if (status != TechnicalServiceStatusFilter.needsService) return const [];
+    return [
+      for (final r in records)
+        ServiceSubmittedBadge(
+          key: ValueKey('technical-service-submitted-${row.vehicleNumber}-${r['id']}'),
+          submittedAt: r['submittedAt'] as DateTime?,
+          submittedByName: (r['submittedByName'] ?? '').toString(),
+          scheduleName: (r['scheduleName'] ?? '').toString(),
+        ),
+    ];
+  }
+
+  Widget _row(TechnicalServiceRow row) {
+    final a = row.alert;
     final button = _primaryButton(a);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            a.vehicleNumber,
-            style: AppText.section,
-            softWrap: true,
-          ),
-          Text(
-            a.dueKm != null ? '${a.title} — ${a.dueKm!.toStringAsFixed(0)} km' : a.title,
-            style: AppText.caption,
-            softWrap: true,
-          ),
-          const SizedBox(height: 4),
-          Wrap(
-            spacing: AppSpacing.sm,
-            runSpacing: AppSpacing.xs,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              Container(
-                constraints: const BoxConstraints(maxWidth: 260),
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: _statusColor(a),
-                  borderRadius: BorderRadius.circular(AppRadius.chip),
+    final submittedBadges = _submittedBadges(row);
+    return InkWell(
+      key: ValueKey('technical-service-row-${row.vehicleNumber}'),
+      onTap: () => _openTruck(row),
+      child: Padding(
+        padding: const EdgeInsets.only(top: AppSpacing.xs),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(row.vehicleNumber, style: AppText.section, softWrap: true),
                 ),
-                child: Text(
-                  _statusLabel(a),
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
-                  ),
-                  softWrap: true,
-                ),
+                const Icon(Icons.chevron_right, color: AppColors.textMuted),
+              ],
+            ),
+            if (a != null)
+              Text(
+                a.dueKm != null ? '${a.title} — ${a.dueKm!.toStringAsFixed(0)} km' : a.title,
+                style: AppText.caption,
+                softWrap: true,
               ),
-              if (button != null) button,
-            ],
-          ),
-          const Divider(height: AppSpacing.lg),
-        ],
+            const SizedBox(height: 4),
+            Wrap(
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.xs,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Container(
+                  constraints: const BoxConstraints(maxWidth: 260),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: _statusColor(a),
+                    borderRadius: BorderRadius.circular(AppRadius.chip),
+                  ),
+                  child: Text(
+                    _statusLabel(a),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                    softWrap: true,
+                  ),
+                ),
+                ...submittedBadges,
+                ?button,
+              ],
+            ),
+            const Divider(height: AppSpacing.lg),
+          ],
+        ),
       ),
     );
   }
@@ -31890,37 +32642,132 @@ class _TechnicalHomeServiceCardState extends State<TechnicalHomeServiceCard> {
       );
     }
     if (!_qualifies) return const SizedBox.shrink();
-    if (_rows.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.only(bottom: AppSpacing.md),
-        child: AppCard(
-          child: EmptyState(icon: Icons.build_circle_outlined, title: 'NO SERVICES DUE'),
-        ),
-      );
-    }
-    final shown = _rows.take(5).toList();
+    final shownRows = _rowsFor(_ownership);
+    final listRows = _listRowsFor(_status);
+    final isPhone = MediaQuery.of(context).size.width < kTechnicalHomeWideBreakpoint;
+    final shownVehicles = {for (final r in shownRows) r.vehicleNumber};
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpacing.md),
       child: AppCard(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('SERVICE', style: AppText.section),
-            const SizedBox(height: AppSpacing.sm),
-            for (final a in shown) _row(a),
-            if (_rows.length > 5)
+            // Compact header: "SERVICE (N)" for the selected filter,
+            // tap to collapse/expand (default expanded).
+            InkWell(
+              key: const ValueKey('technical-service-toggle'),
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(minHeight: 40),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text('SERVICE (${shownRows.length})', style: AppText.section),
+                    ),
+                    Icon(
+                      _expanded ? Icons.expand_less : Icons.expand_more,
+                      color: AppColors.textMuted,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_expanded) ...[
+              const SizedBox(height: AppSpacing.sm),
+              Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: AppSpacing.xs,
+                children: [
+                  for (final f in TruckOwnershipFilter.values)
+                    ChoiceChip(
+                      key: ValueKey('technical-service-filter-${f.name}'),
+                      label: Text('${truckOwnershipFilterLabel(f)} (${_rowsFor(f).length})'),
+                      selected: _ownership == f,
+                      onSelected: (_) => setState(() => _ownership = f),
+                    ),
+                ],
+              ),
+              const SizedBox(height: AppSpacing.xs),
+              Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: AppSpacing.xs,
+                children: [
+                  for (final f in TechnicalServiceStatusFilter.values)
+                    ChoiceChip(
+                      key: ValueKey('technical-service-status-${f.name}'),
+                      label: Text(
+                        '${technicalServiceStatusFilterLabel(f)} (${_listRowsFor(f).length})',
+                      ),
+                      selected: _status == f,
+                      onSelected: (_) => setState(() => _status = f),
+                    ),
+                ],
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              // SERVICED / DUE SOON / OVERDUE over the trucks in the
+              // selected filter (same widget as the Management Dashboard,
+              // which keeps counting every truck).
+              ServiceFleetSummaryCounts(
+                key: ValueKey('technical-service-summary-${_ownership.name}'),
+                firestoreOverride: widget.firestoreOverride,
+                currentUidOverride: widget.currentUidOverride,
+                vehicleNumbers: shownVehicles,
+              ),
+              if (listRows.isEmpty)
+                EmptyState(
+                  icon: Icons.build_circle_outlined,
+                  title: switch (_status) {
+                    TechnicalServiceStatusFilter.needsService => 'NO SERVICES DUE',
+                    TechnicalServiceStatusFilter.awaitingApproval => 'NOTHING AWAITING APPROVAL',
+                    _ => 'NO TRUCKS',
+                  },
+                ),
+              // Selected trucks, worst first; tap -> service form. Scrolls
+              // on its own so the home tiles are never pushed away.
+              if (listRows.isNotEmpty)
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: isPhone
+                        ? kTechnicalHomeServiceListMaxHeightPhone
+                        : kTechnicalHomeServiceListMaxHeight,
+                  ),
+                  child: Scrollbar(
+                    controller: _listScroll,
+                    child: SingleChildScrollView(
+                      key: const ValueKey('technical-service-list'),
+                      controller: _listScroll,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [for (final r in listRows) _row(r)],
+                      ),
+                    ),
+                  ),
+                ),
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton(
-                  onPressed: () => Navigator.push(
+                  key: const ValueKey('technical-service-view-all'),
+                  onPressed: () => pushWebAware(
                     context,
-                    MaterialPageRoute(
-                      builder: (_) => VehicleMaintenanceHubScreen(name: widget.name),
+                    ServiceOverviewScreen(
+                      firestoreOverride: widget.firestoreOverride,
+                      currentUidOverride: widget.currentUidOverride,
+                      // Same trucks as the list (unset for All, so the
+                      // overview shows every truck exactly as before).
+                      vehicleScope: _ownership == TruckOwnershipFilter.all
+                          ? null
+                          : (
+                              label: '${truckOwnershipFilterLabel(_ownership)} trucks',
+                              vehicleNumbers: shownVehicles,
+                            ),
                     ),
                   ),
-                  child: const Text('VIEW ALL'),
+                  child: Text(
+                    shownRows.isEmpty ? 'VIEW ALL' : 'VIEW ALL (${shownRows.length} TRUCKS)',
+                  ),
                 ),
               ),
+            ],
           ],
         ),
       ),
@@ -32100,35 +32947,85 @@ class _TechnicalHomeScreenState extends State<TechnicalHomeScreen> {
               hint: 'ASK THE ADMIN',
             );
           }
-          return SingleChildScrollView(
-            child: Align(
-              alignment: Alignment.topCenter,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 480),
-                child: Padding(
-                  padding: const EdgeInsets.all(AppSpacing.lg),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text('Welcome, ${widget.name}', style: AppText.title),
-                      const SizedBox(height: AppSpacing.md),
-                      ServiceAlertsBanner(
-                        firestoreOverride: widget.firestoreOverride,
-                        currentUidOverride: widget.currentUidOverride,
+          final tileWidgets = [
+            for (final tile in tiles.map(_buildTile).whereType<Widget>()) tile,
+          ];
+          final serviceCard = TechnicalHomeServiceCard(
+            key: const ValueKey('technical-home-service-card'),
+            name: widget.name,
+            firestoreOverride: widget.firestoreOverride,
+            currentUidOverride: widget.currentUidOverride,
+          );
+          final header = <Widget>[
+            Text('Welcome, ${widget.name}', style: AppText.title),
+            const SizedBox(height: AppSpacing.md),
+            ServiceAlertsBanner(
+              firestoreOverride: widget.firestoreOverride,
+              currentUidOverride: widget.currentUidOverride,
+            ),
+          ];
+          return LayoutBuilder(builder: (context, constraints) {
+            // Wide (web/tablet): tiles | Service card side by side.
+            if (constraints.maxWidth >= kTechnicalHomeWideBreakpoint) {
+              return SingleChildScrollView(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 1100),
+                    child: Padding(
+                      padding: const EdgeInsets.all(AppSpacing.lg),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          ...header,
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  key: const ValueKey('technical-home-tiles'),
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                                  children: tileWidgets,
+                                ),
+                              ),
+                              const SizedBox(width: AppSpacing.lg),
+                              Expanded(child: serviceCard),
+                            ],
+                          ),
+                        ],
                       ),
-                      TechnicalHomeServiceCard(
-                        name: widget.name,
-                        firestoreOverride: widget.firestoreOverride,
-                        currentUidOverride: widget.currentUidOverride,
-                      ),
-                      for (final tile in tiles.map(_buildTile).whereType<Widget>()) tile,
-                    ],
+                    ),
+                  ),
+                ),
+              );
+            }
+            // Phone: every home tile first (unchanged order), then the
+            // Service card, whose truck list scrolls inside its own cap.
+            return SingleChildScrollView(
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 480),
+                  child: Padding(
+                    padding: const EdgeInsets.all(AppSpacing.lg),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ...header,
+                        Column(
+                          key: const ValueKey('technical-home-tiles'),
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: tileWidgets,
+                        ),
+                        serviceCard,
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
-          );
+            );
+          });
         },
       ),
     );
@@ -32597,6 +33494,7 @@ class _GarageScreenState extends State<GarageScreen>
         backgroundColor: Colors.brown[800],
         foregroundColor: Colors.white,
         actions: [
+          const SupervisorSwitchButton(),
           IconButton(icon: const Icon(Icons.logout), onPressed: _logout),
         ],
         bottom: TabBar(
@@ -38899,6 +39797,12 @@ List<ServiceAlert> serviceAwaitingApprovalAlerts(List<Map<String, dynamic>> reco
       title: 'Awaiting Approval',
       detail: 'SUBMITTED - AWAITING APPROVAL',
       recordId: (r['id'] ?? '').toString(),
+      // Which schedule the submission covers (null = no schedule picked)
+      // — the Technical home card uses it to tell "this truck's due
+      // service is with management" from "something else is still due".
+      scheduleId: ((r['scheduleId'] ?? '').toString().isEmpty)
+          ? null
+          : r['scheduleId'].toString(),
       lastServiceDate: r['submittedAt'] as DateTime?,
       lastSubmitterName: (r['submittedByName'] ?? '').toString(),
       lastSubmitterUid: r['submittedBy'] as String?,
@@ -39983,6 +40887,20 @@ class TruckRepairHubScreen extends StatelessWidget {
               title: 'Service Items',
               subtitle: 'Set up the scheduled service checklist',
               onTap: () => pushWebAware(context, const ServiceItemsScreen()),
+            ));
+          }
+          // RepairSettingsScreen (approval limits, Test Mode, Simple Mode,
+          // Daily Check) had no entry point anywhere, so a Test Mode that
+          // was turned ON could not be turned OFF from the app. Admin/owner
+          // only — the screen's own _canEdit and the settings/* write rule
+          // are both admin/owner.
+          if (isAdminOrOwner) {
+            tiles.add(_tile(
+              index: tiles.length,
+              icon: Icons.settings,
+              title: 'Repair & Service Settings',
+              subtitle: 'Approval limits, Test Mode, inspection mode',
+              onTap: () => pushWebAware(context, const RepairSettingsScreen()),
             ));
           }
 
@@ -45989,8 +46907,8 @@ Future<RepairWorkflowSettings> _fetchRepairWorkflowSettings({FirebaseFirestore? 
 // Cheap live check for the red TEST MODE banner (every Truck Repair screen
 // needs this, so it's a plain settings stream rather than routing through
 // _fetchRepairWorkflowSettings()'s one-shot Future each time).
-Stream<bool> _testModeStream() {
-  return FirebaseFirestore.instance
+Stream<bool> _testModeStream({FirebaseFirestore? db}) {
+  return (db ?? FirebaseFirestore.instance)
       .collection('settings')
       .doc('repair_workflow')
       .snapshots()
@@ -46002,31 +46920,125 @@ Stream<bool> _testModeStream() {
 // is on — identity-exclusion checks (verifier != enterer etc.) are skipped
 // app-wide while this is true, but permissions and amount limits are not.
 class TestModeBanner extends StatelessWidget {
-  const TestModeBanner({super.key});
+  // Test-only seams; production passes neither.
+  final FirebaseFirestore? firestoreOverride;
+  final String? currentUidOverride;
+  const TestModeBanner({super.key, this.firestoreOverride, this.currentUidOverride});
+
+  Future<String?> _role() async {
+    final uid = currentUidOverride ?? FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return null;
+    final doc = await (firestoreOverride ?? FirebaseFirestore.instance)
+        .collection('users')
+        .doc(uid)
+        .get();
+    return doc.data()?['role'] as String?;
+  }
+
+  Future<void> _turnOff(BuildContext context) async {
+    final confirmed = await showAppConfirmDialog(
+      context: context,
+      title: 'Turn Test Mode OFF?',
+      message: 'Identity-exclusion checks (verifier ≠ enterer, approver ≠ '
+          'requester, inspector ≠ completer) go back to being enforced.',
+      confirmLabel: 'Turn Off',
+    );
+    if (!confirmed) return;
+    try {
+      await setRepairTestMode(
+        on: false,
+        db: firestoreOverride,
+        uid: currentUidOverride,
+      );
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to change Test Mode: $e')),
+        );
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<bool>(
-      stream: _testModeStream(),
+      stream: _testModeStream(db: firestoreOverride),
       builder: (context, snap) {
         if (snap.data != true) return const SizedBox.shrink();
         return Container(
+          key: const ValueKey('test-mode-banner'),
           width: double.infinity,
           color: AppColors.danger,
           padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
-          child: const Text(
-            'TEST MODE ON — SAME USER MAY VERIFY / APPROVE / INSPECT',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
-              fontSize: 12,
-            ),
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 8,
+            children: [
+              const Text(
+                'TEST MODE ON — SAME USER MAY VERIFY / APPROVE / INSPECT',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
+              // Only admin/owner can turn it off (same rule as the
+              // RepairSettingsScreen switch and the settings/* write rule).
+              FutureBuilder<String?>(
+                future: _role(),
+                builder: (context, roleSnap) {
+                  final role = roleSnap.data;
+                  if (role != 'admin' && role != 'owner') {
+                    return const SizedBox.shrink();
+                  }
+                  return TextButton(
+                    key: const ValueKey('test-mode-turn-off'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      backgroundColor: Colors.black26,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: () => _turnOff(context),
+                    child: const Text('TURN OFF'),
+                  );
+                },
+              ),
+            ],
           ),
         );
       },
     );
   }
+}
+
+// Writes settings/repair_workflow.testModeAllowSameUser and logs the
+// TEST_MODE_ON/OFF event. Shared by RepairSettingsScreen's switch and the
+// banner's TURN OFF button. Firestore rules already restrict settings/*
+// writes to admin/owner; callers only offer it to admin/owner too.
+Future<void> setRepairTestMode({
+  required bool on,
+  FirebaseFirestore? db,
+  String? uid,
+}) async {
+  final firestore = db ?? FirebaseFirestore.instance;
+  final actorUid = uid ?? FirebaseAuth.instance.currentUser?.uid ?? '';
+  final userDoc = await firestore.collection('users').doc(actorUid).get();
+  final userName = (userDoc.data()?['name'] ?? 'Unknown').toString();
+  await firestore
+      .collection('settings')
+      .doc('repair_workflow')
+      .set({'testModeAllowSameUser': on}, SetOptions(merge: true));
+  await _writeRepairEvent(
+    collection: 'settings',
+    docId: 'repair_workflow',
+    action: on ? 'TEST_MODE_ON' : 'TEST_MODE_OFF',
+    summary: 'Test Mode turned ${on ? 'ON' : 'OFF'} by $userName',
+    actorUid: actorUid,
+    actorName: userName,
+    db: firestore,
+  );
 }
 
 // Small inline chip shown next to a timeline entry whose event was recorded
@@ -47539,22 +48551,7 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
     if (!confirmed) return;
     setState(() => _togglingTestMode = true);
     try {
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final userDoc =
-          await FirebaseFirestore.instance.collection('users').doc(uid).get();
-      final userName = (userDoc.data()?['name'] ?? 'Unknown').toString();
-      await FirebaseFirestore.instance
-          .collection('settings')
-          .doc('repair_workflow')
-          .set({'testModeAllowSameUser': newValue}, SetOptions(merge: true));
-      await _writeRepairEvent(
-        collection: 'settings',
-        docId: 'repair_workflow',
-        action: newValue ? 'TEST_MODE_ON' : 'TEST_MODE_OFF',
-        summary: 'Test Mode turned ${newValue ? 'ON' : 'OFF'} by $userName',
-        actorUid: uid,
-        actorName: userName,
-      );
+      await setRepairTestMode(on: newValue);
       if (mounted) setState(() => _testModeOn = newValue);
     } catch (e) {
       if (mounted) {
@@ -54013,6 +55010,7 @@ class _WarehouseScreenState extends State<WarehouseScreen>
         backgroundColor: Colors.brown[800],
         foregroundColor: Colors.white,
         actions: [
+          const SupervisorSwitchButton(),
           IconButton(icon: const Icon(Icons.logout), onPressed: _logout),
         ],
         bottom: TabBar(
@@ -58397,10 +59395,17 @@ class ServiceAlertsData {
   // fetched because this viewer's permissions didn't need it (that's a
   // scoping decision, not a failure). Empty means a clean, complete fetch.
   final List<String> failedSources;
+  // The SUBMITTED service_records this fetch already read (normalized) —
+  // kept so the Technical home card can show "Awaiting approval" for every
+  // viewer, including technical users holding SERVICE_VIEW (who get the
+  // management-audience pending alert instead of the awaiting one). No
+  // extra Firestore read; nothing else uses it.
+  final List<Map<String, dynamic>> submittedRecords;
   const ServiceAlertsData({
     required this.alerts,
     required this.computedAt,
     this.failedSources = const [],
+    this.submittedRecords = const [],
   });
   bool get hasPartialData => failedSources.isNotEmpty;
 }
@@ -58626,7 +59631,12 @@ Future<ServiceAlertsData> fetchServiceAlertsData({
     if (canSeeManagement) ...dailyCheckLowAlerts(dailyChecks),
     if (canSeeManagement) ...dailyCheckNotDoneAlerts(notChecked),
   ];
-  return ServiceAlertsData(alerts: alerts, computedAt: now, failedSources: failedSources);
+  return ServiceAlertsData(
+    alerts: alerts,
+    computedAt: now,
+    failedSources: failedSources,
+    submittedRecords: serviceRecordsOk ? submittedRecords : const [],
+  );
 }
 
 // Shared, single-listener cache for small reference collections (sites,
@@ -58953,6 +59963,10 @@ class ServiceAlertsCache {
     _inFlightByUid[uidKey] = future;
     return future;
   }
+
+  // Last fetched data for a uid (null before the first fetch) — read right
+  // after get(), never triggers a fetch itself.
+  static ServiceAlertsData? peek(String uidKey) => _dataByUid[uidKey];
 
   // Test-only — each widget test needs a clean slate since this cache is
   // process-global, not scoped to a FakeFirebaseFirestore instance.
@@ -60853,6 +61867,13 @@ class _ServiceRecordFormScreenState extends State<ServiceRecordFormScreen> {
       ));
 
       if (!mounted) return;
+      // Survives the pop below, so the technician still sees it on the
+      // screen they return to (e.g. the Technical home Service card).
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      final submittedText = serviceSubmittedSnackText(
+        vehicleNumber: _vehicleNumber,
+        scheduleName: scheduleName,
+      );
       await showDialog<void>(
         context: context,
         builder: (dialogContext) => AlertDialog(
@@ -60867,6 +61888,7 @@ class _ServiceRecordFormScreenState extends State<ServiceRecordFormScreen> {
         ),
       );
       if (mounted) Navigator.pop(context);
+      showServiceSubmittedSnackBar(messenger, submittedText);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -61326,7 +62348,15 @@ class _ServiceOverdueCountBadge extends StatelessWidget {
 class ServiceFleetSummaryCounts extends StatefulWidget {
   final FirebaseFirestore? firestoreOverride;
   final String? currentUidOverride;
-  const ServiceFleetSummaryCounts({super.key, this.firestoreOverride, this.currentUidOverride});
+  // Optional: count only these trucks (Technical home ownership filter).
+  // Null = every truck — the Management Dashboard's existing behaviour.
+  final Set<String>? vehicleNumbers;
+  const ServiceFleetSummaryCounts({
+    super.key,
+    this.firestoreOverride,
+    this.currentUidOverride,
+    this.vehicleNumbers,
+  });
 
   @override
   State<ServiceFleetSummaryCounts> createState() => _ServiceFleetSummaryCountsState();
@@ -61343,8 +62373,11 @@ class _ServiceFleetSummaryCountsState extends State<ServiceFleetSummaryCounts> {
       return (qualifies: false, overdue: 0, dueSoon: 0, serviced: 0);
     }
     final trucksSnap = await _db.collection('trucks').get();
-    final total = trucksSnap.docs.length;
-    final serviceDue = data.alerts.where((a) => a.kind == ServiceAlertKind.serviceDue);
+    final scope = widget.vehicleNumbers;
+    final total = scope == null ? trucksSnap.docs.length : scope.length;
+    final serviceDue = data.alerts.where((a) =>
+        a.kind == ServiceAlertKind.serviceDue &&
+        (scope == null || scope.contains(a.vehicleNumber)));
     final overdueVehicles = serviceDue
         .where((a) =>
             a.severity == ServiceAlertSeverity.overdue || a.severity == ServiceAlertSeverity.missed)
@@ -62552,9 +63585,28 @@ class ServiceScheduleTable extends StatelessWidget {
         ),
         if (provisionalLabel != null) ...[
           const SizedBox(height: 3),
-          DataTableStatusChip(
-            label: provisionalLabel,
-            color: provisionalChipColor(r.provisional),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: DataTableStatusChip(
+                  label: provisionalLabel,
+                  color: provisionalChipColor(r.provisional),
+                ),
+              ),
+              // Same shared "Submitted" mark as the Technical home card,
+              // on the same line so the row height is unchanged; the
+              // status chips themselves are unchanged.
+              if (r.provisional == ServiceProvisionalState.awaitingApproval) ...[
+                const SizedBox(width: 4),
+                Flexible(
+                  child: ServiceSubmittedBadge(
+                    key: ValueKey('service-overview-submitted-${r.vehicleNumber}-${r.serviceType}'),
+                    singleLine: true,
+                  ),
+                ),
+              ],
+            ],
           ),
         ],
       ],
@@ -62653,7 +63705,9 @@ class ServiceScheduleTable extends StatelessWidget {
         ),
         DataTableColumn(
           label: 'Status',
-          width: 160,
+          // Wide enough for AWAITING APPROVAL + the Submitted badge on one
+          // line (fixed row height).
+          width: 250,
           cellBuilder: (_, r) => _statusCell(r),
           compare: compareServiceTableRowsByStatus,
           exportValue: _statusText,
@@ -62711,13 +63765,25 @@ typedef ServiceTimingRow = ({
   String? approvedByUid
 });
 
+// Service Overview is read-only (fleet table, timing, costs, export).
+// SERVICE_VIEW as before (admin/owner always), plus every 'technical'
+// account — the Technical home's Service card links here as its full
+// VIEW ALL list. No write permission is granted by this.
+bool canViewServiceOverview(Map<String, dynamic>? userData) =>
+    hasRepairPerm(userData, kPermServiceView) || userData?['role'] == 'technical';
+
 class ServiceOverviewScreen extends StatefulWidget {
   final FirebaseFirestore? firestoreOverride;
   final String? currentUidOverride;
+  // Optional: limit the SERVICE STATUS table to these trucks — passed only
+  // by the Technical home card's Company / Private filter. Null (every
+  // admin/management entry point) = every truck, unchanged.
+  final ({String label, Set<String> vehicleNumbers})? vehicleScope;
   const ServiceOverviewScreen({
     super.key,
     this.firestoreOverride,
     this.currentUidOverride,
+    this.vehicleScope,
   });
 
   @override
@@ -62733,11 +63799,15 @@ class _ServiceOverviewScreenState extends State<ServiceOverviewScreen>
   // would otherwise be the first read, and dispose() must not be that first
   // read on an already-deactivating element.
   late final TabController _tabController;
-  late final Future<bool> _permFuture = _currentUserHasRepairPerm(
-    kPermServiceView,
-    db: _db,
-    uidOverride: widget.currentUidOverride,
-  );
+  late final Future<bool> _permFuture = _loadCanView();
+
+  Future<bool> _loadCanView() async {
+    final uid = widget.currentUidOverride ?? FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return false;
+    final doc = await _db.collection('users').doc(uid).get();
+    return canViewServiceOverview(doc.data());
+  }
+
   final _searchController = TextEditingController();
   String _searchText = '';
   String _statusFilter = kServiceTableFilterAll;
@@ -63145,7 +64215,10 @@ class _ServiceOverviewScreenState extends State<ServiceOverviewScreen>
     if (_fleetError != null) {
       return ErrorState(message: 'Failed to load: $_fleetError', onRetry: _loadFleet);
     }
-    final all = buildServiceTableRows(_fleet);
+    final scope = widget.vehicleScope;
+    final all = buildServiceTableRows(scope == null
+        ? _fleet
+        : _fleet.where((f) => scope.vehicleNumbers.contains(f.vehicleNumber)).toList());
     final searched = filterServiceTableRows(all, search: _searchText);
     final rows = filterServiceTableRows(searched, bucket: _statusFilter);
     int count(String b) => searched.where((r) => r.bucket == b).length;
@@ -63154,6 +64227,15 @@ class _ServiceOverviewScreenState extends State<ServiceOverviewScreen>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (scope != null)
+            Padding(
+              key: const ValueKey('service-overview-scope'),
+              padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+              child: Text(
+                'Showing: ${scope.label} (${scope.vehicleNumbers.length})',
+                style: AppText.caption,
+              ),
+            ),
           DataTableToolbar(
             onExport: (f) => _export(
               f,
@@ -71612,8 +72694,271 @@ class _QrGenerateTabState extends State<_QrGenerateTab> {
 }
 
 // ---------------- TRUCK MANAGEMENT SCREEN (Admin) ----------------
+// ---------------- TRUCK OWNERSHIP (admin / owner) ----------------
+// One table of every truck with its current ownership (Company / Private /
+// Not set, from truckOwnership()), NOT SET first, filter All | Not set |
+// Company | Private, search, a Company / Private choice per row (one tap
+// saves) and bulk select -> Set Company / Set Private. Saves ONLY
+// trucks/{id}.isCompanyTruck = true/false — no other field is touched.
+// Admin / owner only (the same people firestore.rules already let write
+// trucks; no rules change needed).
+class TruckOwnershipScreen extends StatefulWidget {
+  final FirebaseFirestore? firestoreOverride;
+  final String? currentUidOverride;
+  const TruckOwnershipScreen({super.key, this.firestoreOverride, this.currentUidOverride});
+
+  @override
+  State<TruckOwnershipScreen> createState() => _TruckOwnershipScreenState();
+}
+
+class _TruckOwnershipScreenState extends State<TruckOwnershipScreen> {
+  FirebaseFirestore get _db => widget.firestoreOverride ?? FirebaseFirestore.instance;
+  String? get _uid => widget.currentUidOverride ?? FirebaseAuth.instance.currentUser?.uid;
+  late final Future<bool> _accessFuture = _checkAccess();
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> _trucks =
+      _db.collection('trucks').snapshots();
+  final _search = TextEditingController();
+  String _query = '';
+  TruckOwnershipFilter _filter = TruckOwnershipFilter.all;
+  final Set<String> _selected = {};
+  bool _saving = false;
+
+  Future<bool> _checkAccess() async {
+    final uid = _uid;
+    if (uid == null) return false;
+    final role = (await _db.collection('users').doc(uid).get()).data()?['role'];
+    return role == 'admin' || role == 'owner';
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save(Iterable<String> docIds, bool isCompany) async {
+    if (docIds.isEmpty) return;
+    setState(() => _saving = true);
+    try {
+      final batch = _db.batch();
+      for (final id in docIds) {
+        batch.update(_db.collection('trucks').doc(id), {'isCompanyTruck': isCompany});
+      }
+      await batch.commit();
+      if (mounted) setState(() => _selected.removeAll(docIds.toList()));
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save ownership: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Widget _ownershipChip(TruckOwnership o) {
+    final color = switch (o) {
+      TruckOwnership.company => AppColors.success,
+      TruckOwnership.private => AppColors.primary,
+      TruckOwnership.notSet => AppColors.warning,
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(AppRadius.chip),
+      ),
+      child: Text(
+        truckOwnershipLabel(o).toUpperCase(),
+        style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  Widget _body(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+    String numberOf(QueryDocumentSnapshot<Map<String, dynamic>> d) =>
+        (d.data()['truckNumber'] ?? '').toString();
+    final searched = docs
+        .where((d) => _query.isEmpty || numberOf(d).toUpperCase().contains(_query.toUpperCase()))
+        .toList();
+    int count(TruckOwnershipFilter f) =>
+        searched.where((d) => truckMatchesOwnershipFilter(truckOwnership(d.data()), f)).length;
+    int total(TruckOwnership o) => docs.where((d) => truckOwnership(d.data()) == o).length;
+    final rows = searched
+        .where((d) => truckMatchesOwnershipFilter(truckOwnership(d.data()), _filter))
+        .toList()
+      ..sort((x, y) {
+        final nx = truckOwnership(x.data()) == TruckOwnership.notSet ? 0 : 1;
+        final ny = truckOwnership(y.data()) == TruckOwnership.notSet ? 0 : 1;
+        if (nx != ny) return nx.compareTo(ny);
+        return numberOf(x).compareTo(numberOf(y));
+      });
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.md, AppSpacing.md, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Fleet-wide data check (admin only): how many trucks are
+              // still NOT SET.
+              Text(
+                'Company ${total(TruckOwnership.company)} · '
+                'Private ${total(TruckOwnership.private)} · '
+                'Not set ${total(TruckOwnership.notSet)}',
+                key: const ValueKey('truck-ownership-counts'),
+                style: AppText.section,
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(
+                key: const ValueKey('truck-ownership-search'),
+                controller: _search,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search),
+                  hintText: 'Search truck number',
+                  isDense: true,
+                ),
+                onChanged: (v) => setState(() => _query = v.trim()),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: AppSpacing.xs,
+                children: [
+                  for (final f in const [
+                    TruckOwnershipFilter.all,
+                    TruckOwnershipFilter.notSet,
+                    TruckOwnershipFilter.company,
+                    TruckOwnershipFilter.private,
+                  ])
+                    ChoiceChip(
+                      key: ValueKey('truck-ownership-filter-${f.name}'),
+                      label: Text('${truckOwnershipFilterLabel(f)} (${count(f)})'),
+                      selected: _filter == f,
+                      onSelected: (_) => setState(() => _filter = f),
+                    ),
+                ],
+              ),
+              if (_selected.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: AppSpacing.sm),
+                  child: Wrap(
+                    spacing: AppSpacing.sm,
+                    runSpacing: AppSpacing.xs,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text('${_selected.length} selected', style: AppText.caption),
+                      ElevatedButton(
+                        key: const ValueKey('truck-ownership-bulk-company'),
+                        onPressed: _saving ? null : () => _save({..._selected}, true),
+                        child: const Text('Set Company'),
+                      ),
+                      ElevatedButton(
+                        key: const ValueKey('truck-ownership-bulk-private'),
+                        onPressed: _saving ? null : () => _save({..._selected}, false),
+                        child: const Text('Set Private'),
+                      ),
+                      TextButton(
+                        onPressed: () => setState(_selected.clear),
+                        child: const Text('Clear'),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+        const Divider(),
+        Expanded(
+          child: rows.isEmpty
+              ? const EmptyState(icon: Icons.local_shipping, title: 'NO TRUCKS')
+              : ListView.separated(
+                  padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                  itemCount: rows.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, i) {
+                    final d = rows[i];
+                    final o = truckOwnership(d.data());
+                    return Padding(
+                      key: ValueKey('truck-ownership-row-${d.id}'),
+                      padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+                      child: Wrap(
+                        spacing: AppSpacing.sm,
+                        runSpacing: AppSpacing.xs,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Checkbox(
+                            key: ValueKey('truck-ownership-select-${d.id}'),
+                            value: _selected.contains(d.id),
+                            onChanged: (v) => setState(() {
+                              if (v == true) {
+                                _selected.add(d.id);
+                              } else {
+                                _selected.remove(d.id);
+                              }
+                            }),
+                          ),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(minWidth: 110),
+                            child: Text(numberOf(d), style: AppText.section),
+                          ),
+                          _ownershipChip(o),
+                          TruckOwnershipChoice(
+                            keyPrefix: 'truck-ownership-${d.id}',
+                            value: truckOwnershipChoiceValue(d.data()),
+                            onChanged: _saving ? null : (v) => _save([d.id], v),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Truck Ownership')),
+      body: FutureBuilder<bool>(
+        future: _accessFuture,
+        builder: (context, access) {
+          if (access.connectionState != ConnectionState.done) return const LoadingState();
+          if (access.data != true) {
+            return const EmptyState(
+              key: ValueKey('truck-ownership-no-access'),
+              icon: Icons.lock_outline,
+              title: 'NO ACCESS',
+              hint: 'ADMIN / OWNER ONLY',
+            );
+          }
+          return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: _trucks,
+            builder: (context, snap) {
+              if (snap.hasError) {
+                return ErrorState(
+                  message: 'Failed to load trucks: ${snap.error}',
+                  onRetry: () => setState(() {}),
+                );
+              }
+              if (!snap.hasData) return const LoadingState();
+              return _body(snap.data!.docs);
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
 class TruckManagementScreen extends StatefulWidget {
-  const TruckManagementScreen({super.key});
+  // Test seam only — every production call site omits it.
+  final FirebaseFirestore? firestoreOverride;
+  const TruckManagementScreen({super.key, this.firestoreOverride});
 
   @override
   State<TruckManagementScreen> createState() => _TruckManagementScreenState();
@@ -71627,7 +72972,10 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
   String _searchQuery = '';
   String? _selectedDriverUid;
   String? _selectedDriverName;
-  bool _isCompanyTruck = false;
+  // Company (true) / Private (false) — must be chosen explicitly; null =
+  // nothing chosen yet, and the truck is not saved until it is.
+  bool? _isCompanyTruck;
+  FirebaseFirestore get _db => widget.firestoreOverride ?? _db;
 
   Future<void> _addTruck() async {
     final enteredTruckNumber = _truckNumberController.text.trim();
@@ -71637,8 +72985,18 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
       );
       return;
     }
+    final isCompanyTruck = _isCompanyTruck;
+    if (isCompanyTruck == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          key: ValueKey('add-truck-ownership-required'),
+          content: Text('Please choose Company or Private.'),
+        ),
+      );
+      return;
+    }
 
-    final existingTrucks = await FirebaseFirestore.instance
+    final existingTrucks = await _db
         .collection('trucks')
         .get();
     final normalizedEntry = enteredTruckNumber.trim().toUpperCase();
@@ -71666,13 +73024,13 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
       _cubeCapacityController.text.trim(),
     );
 
-    await FirebaseFirestore.instance.collection('trucks').add({
+    await _db.collection('trucks').add({
       'truckNumber': enteredTruckNumber,
       'assignedDriverUid': _selectedDriverUid,
       'assignedDriverName': _selectedDriverName,
       'gpsDeviceId': enteredGpsDeviceId.isEmpty ? null : enteredGpsDeviceId,
       'cubeCapacity': enteredCubeCapacity,
-      'isCompanyTruck': _isCompanyTruck,
+      'isCompanyTruck': isCompanyTruck,
       'createdAt': FieldValue.serverTimestamp(),
     });
 
@@ -71682,7 +73040,7 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
     setState(() {
       _selectedDriverUid = null;
       _selectedDriverName = null;
-      _isCompanyTruck = false;
+      _isCompanyTruck = null;
     });
 
     if (mounted) {
@@ -71693,7 +73051,7 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
   }
 
   Future<void> _deleteTruck(String docId) async {
-    await FirebaseFirestore.instance.collection('trucks').doc(docId).delete();
+    await _db.collection('trucks').doc(docId).delete();
   }
 
   @override
@@ -71702,6 +73060,17 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
       appBar: AppBar(
         title: const Text('Manage Trucks'),
         backgroundColor: Colors.deepOrange[800],
+        actions: [
+          TextButton.icon(
+            key: const ValueKey('manage-trucks-ownership-link'),
+            onPressed: () => pushWebAware(
+              context,
+              TruckOwnershipScreen(firestoreOverride: widget.firestoreOverride),
+            ),
+            icon: const Icon(Icons.fact_check_outlined, color: Colors.white),
+            label: const Text('Truck Ownership', style: TextStyle(color: Colors.white)),
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -71723,7 +73092,7 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
                 ),
                 const SizedBox(height: 12),
                 StreamBuilder<QuerySnapshot>(
-                  stream: assignableTruckDriversStream(),
+                  stream: assignableTruckDriversStream(db: widget.firestoreOverride),
                   builder: (context, snapshot) {
                     if (!snapshot.hasData)
                       return const CircularProgressIndicator();
@@ -71784,13 +73153,23 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
                 // Garage module (see GarageScreen) — only company trucks
                 // with a GPS device are eligible for KM-based service
                 // tracking there.
-                CheckboxListTile(
-                  title: const Text('Is Company Truck?'),
-                  value: _isCompanyTruck,
-                  contentPadding: EdgeInsets.zero,
-                  controlAffinity: ListTileControlAffinity.leading,
-                  onChanged: (val) =>
-                      setState(() => _isCompanyTruck = val ?? false),
+                // Company / Private — explicit choice, no default (the
+                // old "Is Company Truck?" checkbox defaulted to unticked,
+                // silently saving false = private).
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 12, bottom: 6),
+                    child: Text('Ownership *', style: AppText.caption),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TruckOwnershipChoice(
+                    keyPrefix: 'add-truck-ownership',
+                    value: _isCompanyTruck,
+                    onChanged: (v) => setState(() => _isCompanyTruck = v),
+                  ),
                 ),
                 const SizedBox(height: 16),
                 SizedBox(
@@ -71842,7 +73221,7 @@ class _TruckManagementScreenState extends State<TruckManagementScreen> {
           ),
           Expanded(
             child: StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance
+              stream: _db
                   .collection('trucks')
                   .orderBy('createdAt', descending: true)
                   .snapshots(),
@@ -75186,8 +76565,6 @@ class TruckProfileScreen extends StatelessWidget {
                               final cubeCapacity =
                                   (truckData?['cubeCapacity'] as num?)
                                       ?.toDouble();
-                              final isCompanyTruck =
-                                  truckData?['isCompanyTruck'] == true;
 
                               return Column(
                                 children: [
@@ -75409,43 +76786,39 @@ class TruckProfileScreen extends StatelessWidget {
                                   const SizedBox(height: 16),
                                   // Garage module (see GarageScreen) — only
                                   // company trucks are offered there for
-                                  // KM-based service tracking.
+                                  // KM-based service tracking. Company /
+                                  // Private (shared TruckOwnershipChoice);
+                                  // a truck with no field reads NOT SET.
                                   GlassCard(
-                                    child: Row(
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.spaceBetween,
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              'Is Company Truck?',
-                                              style: TextStyle(
-                                                color: Colors.white.withOpacity(
-                                                  0.6,
-                                                ),
-                                                fontSize: 11,
-                                              ),
-                                            ),
-                                            Text(
-                                              isCompanyTruck ? 'Yes' : 'No',
-                                              style: const TextStyle(
-                                                color: Colors.white,
-                                                fontWeight: FontWeight.bold,
-                                                fontSize: 14,
-                                              ),
-                                            ),
-                                          ],
+                                        Text(
+                                          'Ownership',
+                                          style: TextStyle(
+                                            color: Colors.white.withValues(alpha: 0.6),
+                                            fontSize: 11,
+                                          ),
                                         ),
-                                        Switch(
-                                          value: isCompanyTruck,
-                                          activeColor: AppTheme.accent,
-                                          onChanged: (val) => FirebaseFirestore
-                                              .instance
-                                              .collection('trucks')
-                                              .doc(truckId)
-                                              .update({'isCompanyTruck': val}),
+                                        Text(
+                                          truckOwnershipLabel(truckOwnership(truckData)),
+                                          key: const ValueKey('truck-profile-ownership'),
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 14,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 8),
+                                        TruckOwnershipChoice(
+                                          keyPrefix: 'truck-profile-ownership',
+                                          value: truckOwnershipChoiceValue(truckData),
+                                          onDarkForeground: Colors.white,
+                                          onChanged: (val) =>
+                                              (firestoreOverride ?? FirebaseFirestore.instance)
+                                                  .collection('trucks')
+                                                  .doc(truckId)
+                                                  .update({'isCompanyTruck': val}),
                                         ),
                                       ],
                                     ),
