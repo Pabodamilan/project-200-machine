@@ -24195,7 +24195,11 @@ class _DriverTypeScreenState extends State<DriverTypeScreen> {
         ),
       );
       if (mounted) {
-        setState(() => _dailyCheckCardFuture = _loadDailyCheckCardState());
+        // Block body: an arrow closure would return the assigned Future,
+        // which setState rejects (debug assert) after SKIP / submit.
+        setState(() {
+          _dailyCheckCardFuture = _loadDailyCheckCardState();
+        });
       }
     } catch (e) {
       debugPrint('[DRIVER] daily check auto-prompt navigation ERROR: $e');
@@ -24573,6 +24577,8 @@ class DriverDailyCheckScreen extends StatefulWidget {
   // Driver home (daily-check-only flow): on success, replace this screen
   // with DailyCheckSubmittedScreen instead of popping straight back.
   final bool showSuccessScreen;
+  // Tests only: the device clock (production: DateTime.now).
+  final DateTime Function()? clockOverride;
   const DriverDailyCheckScreen({
     super.key,
     required this.vehicleNumber,
@@ -24584,6 +24590,7 @@ class DriverDailyCheckScreen extends StatefulWidget {
     this.photoUploaderOverride,
     this.debugInitialPhotos,
     this.showSuccessScreen = false,
+    this.clockOverride,
   });
 
   @override
@@ -24605,7 +24612,19 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
           )..photoBytes = widget.debugInitialPhotos?[d.id])
       .toList();
 
-  String get _docId => dailyCheckDocId(widget.vehicleNumber, DateTime.now());
+  DateTime _now() => (widget.clockOverride ?? DateTime.now)();
+
+  // Colombo day when the screen opened — only used to pre-fill from an
+  // existing same-day check.
+  late final String _openDateKey = colomboDateKey(_now());
+  String get _openDocId => dailyCheckDocIdForKey(widget.vehicleNumber, _openDateKey);
+
+  // Captured on the FIRST valid SUBMIT tap and kept for every RETRY, so a
+  // check submitted at 23:50 whose photo upload only succeeds after
+  // midnight (or after the phone comes back online) is still saved under
+  // the day the driver submitted it — never the retry/sync day.
+  DateTime? _submitInstant;
+  String? _submitDateKey;
 
   @override
   void initState() {
@@ -24637,8 +24656,8 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
     setState(() => _loading = true);
     try {
       final snap = await logDriverFs(
-        'GET daily_checks/$_docId',
-        () => _db.collection('daily_checks').doc(_docId).get(),
+        'GET daily_checks/$_openDocId',
+        () => _db.collection('daily_checks').doc(_openDocId).get(),
       );
       final data = snap.data();
       if (data != null) {
@@ -24698,9 +24717,12 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
       }
       return;
     }
-    debugPrint('[DRIVER] daily check submit START vehicleNumber=${widget.vehicleNumber}');
+    final submitInstant = _submitInstant ??= _now();
+    final dateKey = _submitDateKey ??= colomboDateKey(submitInstant);
+    final docId = dailyCheckDocIdForKey(widget.vehicleNumber, dateKey);
+    debugPrint('[DRIVER] daily check submit START vehicleNumber=${widget.vehicleNumber} '
+        'date=$dateKey ($kDailyCheckTimezone)');
     try {
-      final dateKey = dailyCheckDateKey(DateTime.now());
       final normalizedVehicleNumber = normalizeVehicleNumber(widget.vehicleNumber);
       final uid = _uid ?? '';
       // users/{uid} read first: name for the doc + role for diagnostics.
@@ -24778,6 +24800,19 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
           row.uploadedUrl = url;
           row.uploadedPath = p;
         }
+        // Never save a check line without its (required) photo reference.
+        if ((url == null || url.isEmpty) && (path == null || path.isEmpty)) {
+          throw DailyCheckUploadException(
+            checkLabel: row.label,
+            code: 'no-photo-url',
+            uid: uid,
+            role: role,
+            path: path ?? '-',
+            contentType: '-',
+            sizeBytes: row.photoBytes?.length ?? 0,
+            cause: 'photo uploaded but no download URL was returned',
+          );
+        }
         checksData.add({
           'id': row.id,
           'label': row.label,
@@ -24788,17 +24823,24 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
         });
       }
       final hasLow = dailyCheckAnyLow(checksData);
+      // The pre-filled createdAt belongs to the doc read at open time; only
+      // keep it when this submit targets that same day's doc.
+      final existingCreatedAt = dateKey == _openDateKey ? _existingCreatedAt : null;
       await logDriverFs(
-        'SET daily_checks/$_docId',
-        () => _db.collection('daily_checks').doc(_docId).set({
+        'SET daily_checks/$docId',
+        () => _db.collection('daily_checks').doc(docId).set({
           'vehicleNumber': normalizedVehicleNumber,
           'date': dateKey,
+          'dateTimezone': kDailyCheckTimezone,
+          // Device moment of the first SUBMIT tap (server times below are
+          // when the write reached Firestore — later when offline/retried).
+          'deviceSubmittedAt': Timestamp.fromDate(submitInstant),
           'driverUid': uid,
           'driverName': userName,
           'siteId': widget.siteId ?? '',
           'checks': checksData,
           'hasLow': hasLow,
-          'createdAt': _existingCreatedAt ?? FieldValue.serverTimestamp(),
+          'createdAt': existingCreatedAt ?? FieldValue.serverTimestamp(),
           'submittedBy': uid,
           'submittedByName': userName,
           'submittedAt': FieldValue.serverTimestamp(),
@@ -24806,10 +24848,10 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
         }, SetOptions(merge: true)),
       );
       await logDriverFs(
-        'WRITE EVENT daily_checks/$_docId',
+        'WRITE EVENT daily_checks/$docId',
         () => _writeRepairEvent(
           collection: 'daily_checks',
-          docId: _docId,
+          docId: docId,
           action: 'SUBMITTED',
           summary: 'Daily check submitted by $userName for $normalizedVehicleNumber'
               '${hasLow ? ' — LOW reported' : ''}',
@@ -24826,6 +24868,7 @@ class _DriverDailyCheckScreenState extends State<DriverDailyCheckScreen> {
             builder: (_) => DailyCheckSubmittedScreen(
               truckNumber: normalizedVehicleNumber,
               dateKey: dateKey,
+              checks: checksData,
             ),
           ),
           result: true,
@@ -25116,23 +25159,13 @@ class _DailyCheckPhotoPickerState extends State<_DailyCheckPhotoPicker> {
         ] else if (widget.existingUrl != null && widget.existingUrl!.isNotEmpty) ...[
           ClipRRect(
             borderRadius: BorderRadius.circular(8),
-            child: Image.network(
-              widget.existingUrl!,
+            // Decoded at thumbnail size (x3 for high-DPI screens) instead of
+            // full camera resolution.
+            child: DailyCheckPhoto(
+              photo: DailyCheckPhotoRef(url: widget.existingUrl),
               width: 56,
               height: 56,
-              fit: BoxFit.cover,
-              // Decodes the downloaded photo at this thumbnail's own size
-              // (x3 for high-DPI screens) instead of full camera
-              // resolution — same pixels on screen, far less memory/CPU
-              // per thumbnail.
-              cacheWidth: 168,
-              cacheHeight: 168,
-              errorBuilder: (_, __, ___) => Container(
-                width: 56,
-                height: 56,
-                color: AppColors.textMuted.withOpacity(0.1),
-                child: const Icon(Icons.broken_image, size: 20),
-              ),
+              cacheSize: 168,
             ),
           ),
           const SizedBox(width: 8),
@@ -25150,6 +25183,327 @@ class _DailyCheckPhotoPickerState extends State<_DailyCheckPhotoPicker> {
             label: Text(hasPhoto ? 'RETAKE PHOTO' : 'ADD PHOTO (REQUIRED)'),
           ),
         ),
+      ],
+    );
+  }
+}
+
+// ---------------- DAILY CHECK PHOTOS (shared viewer widgets) ----------------
+// One widget for every place a saved daily-check photo is shown (admin
+// Daily Checks list, driver read-only screen, submitted screen, the form's
+// existing-photo thumbnail):
+//  - uses the stored photoUrl (Storage download URL with token); when only
+//    photoPath is stored, resolves it with getDownloadURL();
+//  - spinner while resolving/downloading;
+//  - on failure: icon + "Photo not available" + Retry (never a blank box);
+//  - web: webHtmlElementStrategy.fallback — CanvasKit fetches images with
+//    XHR, which a Storage bucket without a CORS config blocks; the
+//    fallback then shows the same URL in a plain <img> element, which
+//    needs no CORS.
+
+/// Tests only: replaces Storage getDownloadURL for path-only photos.
+typedef StorageDownloadUrlResolver = Future<String> Function(String path);
+
+/// One photo of a daily check: url and/or Storage path plus a caption.
+class DailyCheckPhotoRef {
+  final String? url;
+  final String? path;
+  final String label;
+  const DailyCheckPhotoRef({this.url, this.path, this.label = ''});
+
+  bool get hasPhoto => (url ?? '').isNotEmpty || (path ?? '').isNotEmpty;
+
+  static List<DailyCheckPhotoRef> fromChecks(Iterable<Map<String, dynamic>> checks) => [
+        for (final c in checks)
+          DailyCheckPhotoRef(
+            url: (c['photoUrl'] as String?)?.trim(),
+            path: (c['photoPath'] as String?)?.trim(),
+            label: (c['label'] ?? c['id'] ?? '').toString(),
+          ),
+      ];
+}
+
+class DailyCheckPhoto extends StatefulWidget {
+  final DailyCheckPhotoRef photo;
+  final double? width;
+  final double? height;
+  final BoxFit fit;
+  // Decode size for thumbnails (null = full size, e.g. the zoom viewer).
+  final int? cacheSize;
+  final VoidCallback? onTap;
+  final bool onDark;
+  final StorageDownloadUrlResolver? resolverOverride;
+
+  /// Tests only: builds the image provider for a resolved URL.
+  static ImageProvider Function(String url)? debugImageProviderBuilder;
+
+  /// Tests only: replaces getDownloadURL for every path-only photo.
+  static StorageDownloadUrlResolver? debugUrlResolver;
+
+  const DailyCheckPhoto({
+    super.key,
+    required this.photo,
+    this.width,
+    this.height,
+    this.fit = BoxFit.cover,
+    this.cacheSize,
+    this.onTap,
+    this.onDark = false,
+    this.resolverOverride,
+  });
+
+  @override
+  State<DailyCheckPhoto> createState() => _DailyCheckPhotoState();
+}
+
+class _DailyCheckPhotoState extends State<DailyCheckPhoto> {
+  late Future<String?> _url = _resolve();
+  int _attempt = 0;
+  ImageProvider? _provider;
+
+  @override
+  void didUpdateWidget(covariant DailyCheckPhoto oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.photo.url != widget.photo.url || oldWidget.photo.path != widget.photo.path) {
+      _provider = null;
+      _url = _resolve();
+    }
+  }
+
+  Future<String?> _resolve() async {
+    final url = widget.photo.url;
+    if (url != null && url.isNotEmpty) return url;
+    final path = widget.photo.path;
+    if (path == null || path.isEmpty) return null;
+    final resolver = widget.resolverOverride ?? DailyCheckPhoto.debugUrlResolver;
+    if (resolver != null) return resolver(path);
+    return FirebaseStorage.instance.ref(path).getDownloadURL();
+  }
+
+  ImageProvider _providerFor(String url) {
+    final builder = DailyCheckPhoto.debugImageProviderBuilder;
+    final base = builder != null
+        ? builder(url)
+        : NetworkImage(url, webHtmlElementStrategy: WebHtmlElementStrategy.fallback);
+    final size = widget.cacheSize;
+    return size == null ? base : ResizeImage(base, width: size, height: size);
+  }
+
+  void _retry() {
+    _provider?.evict();
+    setState(() {
+      _attempt++;
+      _provider = null;
+      _url = _resolve();
+    });
+  }
+
+  Color get _fg => widget.onDark ? Colors.white70 : AppColors.textSecondary;
+
+  Widget _box(Widget child) => Container(
+        width: widget.width,
+        height: widget.height,
+        alignment: Alignment.center,
+        color: widget.onDark ? Colors.white10 : AppColors.textMuted.withValues(alpha: 0.1),
+        child: child,
+      );
+
+  Widget _loading() => _box(SizedBox(
+        width: 18,
+        height: 18,
+        child: CircularProgressIndicator(strokeWidth: 2, color: widget.onDark ? Colors.white : null),
+      ));
+
+  Widget _unavailable() => _box(Padding(
+        padding: const EdgeInsets.all(4),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.broken_image_outlined, color: _fg, size: 22),
+              const SizedBox(height: 2),
+              Text('Photo not available', style: TextStyle(fontSize: 11, color: _fg)),
+              TextButton.icon(
+                key: const ValueKey('daily-check-photo-retry'),
+                onPressed: _retry,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Retry'),
+                style: TextButton.styleFrom(
+                  foregroundColor: widget.onDark ? Colors.white : null,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ));
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.photo.hasPhoto) {
+      return _box(FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.image_not_supported_outlined, color: _fg, size: 20),
+              Text('No photo', style: TextStyle(fontSize: 11, color: _fg)),
+            ],
+          ),
+        ),
+      ));
+    }
+    return FutureBuilder<String?>(
+      key: ValueKey('daily-check-photo-attempt-$_attempt'),
+      future: _url,
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) return _loading();
+        final url = snap.data;
+        if (snap.hasError || url == null || url.isEmpty) {
+          if (snap.hasError) debugPrint('[DAILY CHECK PHOTO] resolve failed: ${snap.error}');
+          return _unavailable();
+        }
+        final provider = _provider ??= _providerFor(url);
+        final image = Image(
+          image: provider,
+          width: widget.width,
+          height: widget.height,
+          fit: widget.fit,
+          loadingBuilder: (context, child, progress) =>
+              progress == null ? child : _loading(),
+          errorBuilder: (context, error, _) {
+            debugPrint('[DAILY CHECK PHOTO] load failed: $error');
+            return _unavailable();
+          },
+        );
+        if (widget.onTap == null) return image;
+        return GestureDetector(onTap: widget.onTap, child: image);
+      },
+    );
+  }
+}
+
+/// Full-screen swipe + pinch-zoom viewer for a daily check's photos.
+class DailyCheckPhotoViewerScreen extends StatefulWidget {
+  final List<DailyCheckPhotoRef> photos;
+  final int initialIndex;
+  const DailyCheckPhotoViewerScreen({super.key, required this.photos, this.initialIndex = 0});
+
+  static void open(BuildContext context, List<DailyCheckPhotoRef> photos, int index) {
+    final withPhoto = photos.where((p) => p.hasPhoto).toList();
+    if (withPhoto.isEmpty) return;
+    final start = withPhoto.indexOf(photos[index]).clamp(0, withPhoto.length - 1);
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DailyCheckPhotoViewerScreen(photos: withPhoto, initialIndex: start),
+      ),
+    );
+  }
+
+  @override
+  State<DailyCheckPhotoViewerScreen> createState() => _DailyCheckPhotoViewerScreenState();
+}
+
+class _DailyCheckPhotoViewerScreenState extends State<DailyCheckPhotoViewerScreen> {
+  late int _index = widget.initialIndex;
+  late final PageController _controller = PageController(initialPage: widget.initialIndex);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final label = widget.photos[_index].label;
+    return Scaffold(
+      key: const ValueKey('daily-check-photo-viewer'),
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        title: Text(
+          '${label.isEmpty ? '' : '${label.toUpperCase()} · '}'
+          '${_index + 1} / ${widget.photos.length}',
+        ),
+      ),
+      body: PageView.builder(
+        controller: _controller,
+        itemCount: widget.photos.length,
+        onPageChanged: (i) => setState(() => _index = i),
+        itemBuilder: (context, i) => InteractiveViewer(
+          maxScale: 5,
+          child: Center(
+            child: DailyCheckPhoto(
+              photo: widget.photos[i],
+              fit: BoxFit.contain,
+              onDark: true,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Thumbnail grid (label under each) — tap opens the zoom viewer.
+/// Shows "No photos" when no line has a photo.
+class DailyCheckPhotosGrid extends StatelessWidget {
+  final List<Map<String, dynamic>> checks;
+  final double size;
+  const DailyCheckPhotosGrid({super.key, required this.checks, this.size = 96});
+
+  @override
+  Widget build(BuildContext context) {
+    final photos = DailyCheckPhotoRef.fromChecks(checks);
+    if (!photos.any((p) => p.hasPhoto)) {
+      return Row(
+        key: const ValueKey('daily-check-no-photos'),
+        children: [
+          const Icon(Icons.image_not_supported_outlined, size: 18, color: AppColors.textSecondary),
+          const SizedBox(width: 6),
+          Text('No photos', style: AppText.caption),
+        ],
+      );
+    }
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        for (var i = 0; i < photos.length; i++)
+          SizedBox(
+            width: size,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: DailyCheckPhoto(
+                    key: ValueKey('daily-check-thumb-$i'),
+                    photo: photos[i],
+                    width: size,
+                    height: size,
+                    cacheSize: (size * 3).round(),
+                    onTap: photos[i].hasPhoto
+                        ? () => DailyCheckPhotoViewerScreen.open(context, photos, i)
+                        : null,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  photos[i].label.toUpperCase(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          ),
       ],
     );
   }
@@ -39966,6 +40320,65 @@ String? repairCategoryForDailyCheckId(String id) {
 String dailyCheckDateKey(DateTime date) =>
     '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
 
+// ---- Daily check day = the Asia/Colombo calendar day ----
+// Sri Lanka has no DST, so Asia/Colombo is a fixed UTC+05:30. The day is
+// computed from the absolute instant (DateTime.toUtc()), so a phone set to
+// the wrong timezone (or UTC) still lands on the Colombo day.
+const String kDailyCheckTimezone = 'Asia/Colombo';
+const Duration kColomboUtcOffset = Duration(hours: 5, minutes: 30);
+
+/// A UTC DateTime whose year/month/day/hour/minute fields read as the
+/// Colombo wall clock for [instant].
+DateTime colomboWallClock(DateTime instant) => instant.toUtc().add(kColomboUtcOffset);
+
+/// yyyy-MM-dd of [instant] in Asia/Colombo.
+String colomboDateKey(DateTime instant) => dailyCheckDateKey(colomboWallClock(instant));
+
+/// daily_checks doc id for an already-computed Colombo date key.
+String dailyCheckDocIdForKey(String vehicleNumber, String dateKey) =>
+    '${normalizeVehicleNumber(vehicleNumber)}_$dateKey';
+
+/// daily_checks doc id for [instant]'s Colombo day.
+String colomboDailyCheckDocId(String vehicleNumber, DateTime instant) =>
+    dailyCheckDocIdForKey(vehicleNumber, colomboDateKey(instant));
+
+/// "yyyy-MM-dd h:mm AM" in Asia/Colombo, '—' when not a Timestamp.
+String formatColomboDateTime(Object? ts) {
+  if (ts is! Timestamp) return '—';
+  final dt = colomboWallClock(ts.toDate());
+  final hour = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
+  final period = dt.hour >= 12 ? 'PM' : 'AM';
+  return '${dailyCheckDateKey(dt)} $hour:${dt.minute.toString().padLeft(2, '0')} $period';
+}
+
+/// Date inconsistencies on one daily_checks doc (empty = consistent):
+/// the doc id's date, the `date` field, and the Colombo day of the
+/// submit time (deviceSubmittedAt when present — the moment the driver
+/// tapped SUBMIT — else the server's submittedAt/createdAt, which for an
+/// offline/queued write is the SYNC time, not the submit time).
+/// Read-only diagnostics for the admin list; never used to rewrite data.
+List<String> dailyCheckDateIssues(String docId, Map<String, dynamic> data) {
+  final issues = <String>[];
+  final date = (data['date'] ?? '').toString();
+  final idMatch = RegExp(r'_(\d{4}-\d{2}-\d{2})$').firstMatch(docId);
+  final idDate = idMatch?.group(1);
+  if (date.isEmpty) {
+    issues.add('date field missing');
+  } else if (idDate != null && idDate != date) {
+    issues.add('doc id date $idDate ≠ date $date');
+  }
+  final device = data['deviceSubmittedAt'];
+  final server = data['submittedAt'] ?? data['createdAt'];
+  if (device is Timestamp) {
+    final d = colomboDateKey(device.toDate());
+    if (date.isNotEmpty && d != date) issues.add('submitted on device $d ≠ date $date');
+  } else if (server is Timestamp) {
+    final d = colomboDateKey(server.toDate());
+    if (date.isNotEmpty && d != date) issues.add('saved on server $d ≠ date $date');
+  }
+  return issues;
+}
+
 // Trucks are registered with an uppercase-formatted truckNumber (see
 // UpperCaseTextFormatter at registration), but older data or any stray
 // whitespace could still drift — normalizing here (and everywhere a
@@ -40079,7 +40492,7 @@ Future<bool> dailyCheckSubmittedToday(
   String? uid,
 }) async {
   final ctx = await logDriverAuthContext(db: db, uid: uid);
-  final docId = dailyCheckDocId(vehicleNumber, DateTime.now());
+  final docId = colomboDailyCheckDocId(vehicleNumber, DateTime.now());
   try {
     final snap = await logDriverFs(
       'GET daily_checks/$docId',
@@ -40096,6 +40509,10 @@ Future<bool> fetchDailyCheckAllowSkip({FirebaseFirestore? db, String? uid}) asyn
     'GET settings/repair_workflow',
     () => _fetchRepairWorkflowSettings(db: db),
   );
+  // Setting OFF -> never blocking, whoever this is: answer before the
+  // users/{uid} role read, so a failure there can't turn OFF back into a
+  // must-complete check.
+  if (!settings.requireDailyCheck) return true;
   var isAdminOrOwner = false;
   if (uid != null) {
     final userDoc = await logDriverFs(
@@ -47041,6 +47458,138 @@ Future<void> setRepairTestMode({
   );
 }
 
+// ---- Require Daily Vehicle Check toggle (settings/repair_workflow
+// .requireDailyCheck) ----
+// The admin switch used to run user-name read -> settings write -> audit
+// event write inside one try, and on ANY failure left the switch where it
+// was with "Failed to change this setting: <raw error>". If only the audit
+// event write (settings/repair_workflow/events/*) was rejected, the setting
+// had in fact been saved but the switch still showed ON. Now each step is
+// separate: only the settings write itself is fatal, and the message names
+// the exact doc path, field and Firestore error code.
+const String kRepairWorkflowSettingsPath = 'settings/repair_workflow';
+const String kRequireDailyCheckField = 'requireDailyCheck';
+
+class SettingsWriteException implements Exception {
+  final String path;
+  final String field;
+  final String code;
+  final String message;
+  const SettingsWriteException({
+    required this.path,
+    required this.field,
+    required this.code,
+    required this.message,
+  });
+  @override
+  String toString() => message;
+}
+
+// One readable sentence per Firestore error code — shown to the admin as-is.
+String describeSettingsWriteError(Object e, {required String path, required String field}) {
+  final code = e is FirebaseException
+      ? e.code
+      : e is TimeoutException
+          ? 'timeout'
+          : e.runtimeType.toString();
+  final detail = e is FirebaseException ? (e.message ?? '') : e.toString();
+  final String reason;
+  switch (code) {
+    case 'permission-denied':
+      reason = 'Firestore rules rejected the write to $path (field "$field"). '
+          'The live rules must allow admin/owner to write this doc and this field, '
+          'and your users/{uid}.role must be "admin" or "owner".';
+      break;
+    case 'unavailable':
+    case 'timeout':
+      reason = 'No response from Firestore while saving $path (offline or slow '
+          'connection). Check the connection and try again.';
+      break;
+    case 'unauthenticated':
+      reason = 'You are signed out. Sign in again and retry.';
+      break;
+    case 'not-found':
+      reason = '$path does not exist and could not be created.';
+      break;
+    default:
+      reason = 'Could not save $path (field "$field").';
+  }
+  return detail.isEmpty ? '$reason [$code]' : '$reason [$code] $detail';
+}
+
+class RequireDailyCheckSaveResult {
+  final bool value;
+  // Non-null when the setting saved but the audit log entry failed.
+  final String? auditWarning;
+  const RequireDailyCheckSaveResult({required this.value, this.auditWarning});
+}
+
+Future<RequireDailyCheckSaveResult> setRequireDailyCheck({
+  required bool on,
+  FirebaseFirestore? db,
+  String? uid,
+  Duration timeout = const Duration(seconds: 20),
+}) async {
+  final firestore = db ?? FirebaseFirestore.instance;
+  final actorUid = uid ?? FirebaseAuth.instance.currentUser?.uid ?? '';
+  if (actorUid.isEmpty) {
+    throw const SettingsWriteException(
+      path: kRepairWorkflowSettingsPath,
+      field: kRequireDailyCheckField,
+      code: 'unauthenticated',
+      message: 'You are signed out. Sign in again and retry. [unauthenticated]',
+    );
+  }
+  // Name lookup is cosmetic (audit summary only) — never blocks the save.
+  var userName = 'Unknown';
+  try {
+    final userDoc = await firestore.collection('users').doc(actorUid).get();
+    userName = (userDoc.data()?['name'] ?? 'Unknown').toString();
+  } catch (e) {
+    debugPrint('[SETTINGS] users/$actorUid name read failed (ignored): $e');
+  }
+  debugPrint('[SETTINGS] WRITE $kRepairWorkflowSettingsPath.$kRequireDailyCheckField=$on START');
+  try {
+    await firestore
+        .collection('settings')
+        .doc('repair_workflow')
+        .set({kRequireDailyCheckField: on}, SetOptions(merge: true))
+        .timeout(timeout);
+  } catch (e) {
+    final code = e is FirebaseException
+        ? e.code
+        : e is TimeoutException
+            ? 'timeout'
+            : e.runtimeType.toString();
+    debugPrint('[SETTINGS] WRITE $kRepairWorkflowSettingsPath.$kRequireDailyCheckField ERR $code: $e');
+    throw SettingsWriteException(
+      path: kRepairWorkflowSettingsPath,
+      field: kRequireDailyCheckField,
+      code: code,
+      message: describeSettingsWriteError(e,
+          path: kRepairWorkflowSettingsPath, field: kRequireDailyCheckField),
+    );
+  }
+  debugPrint('[SETTINGS] WRITE $kRepairWorkflowSettingsPath.$kRequireDailyCheckField OK');
+  String? auditWarning;
+  try {
+    await _writeRepairEvent(
+      collection: 'settings',
+      docId: 'repair_workflow',
+      action: on ? 'REQUIRE_DAILY_CHECK_ON' : 'REQUIRE_DAILY_CHECK_OFF',
+      summary: 'Require Daily Vehicle Check turned ${on ? 'ON' : 'OFF'} by $userName',
+      actorUid: actorUid,
+      actorName: userName,
+      db: firestore,
+    ).timeout(timeout);
+  } catch (e) {
+    debugPrint('[SETTINGS] audit event write failed: $e');
+    auditWarning = describeSettingsWriteError(e,
+        path: '$kRepairWorkflowSettingsPath/events', field: 'audit log');
+  }
+  return RequireDailyCheckSaveResult(value: on, auditWarning: auditWarning);
+}
+
 // Small inline chip shown next to a timeline entry whose event was recorded
 // with testModeOverride: true.
 class TestModeChip extends StatelessWidget {
@@ -47072,11 +47621,16 @@ class TruckRepairScaffold extends StatelessWidget {
   final PreferredSizeWidget? appBar;
   final Widget body;
   final Widget? floatingActionButton;
+  // Test-only seams forwarded to TestModeBanner; production passes neither.
+  final FirebaseFirestore? firestoreOverride;
+  final String? currentUidOverride;
   const TruckRepairScaffold({
     super.key,
     this.appBar,
     required this.body,
     this.floatingActionButton,
+    this.firestoreOverride,
+    this.currentUidOverride,
   });
 
   @override
@@ -47087,7 +47641,10 @@ class TruckRepairScaffold extends StatelessWidget {
       floatingActionButton: floatingActionButton,
       body: Column(
         children: [
-          const TestModeBanner(),
+          TestModeBanner(
+            firestoreOverride: firestoreOverride,
+            currentUidOverride: currentUidOverride,
+          ),
           Expanded(
             child: Center(
               child: ConstrainedBox(
@@ -48413,7 +48970,10 @@ class _WorkflowInspectorDetail extends StatelessWidget {
 }
 
 class RepairSettingsScreen extends StatefulWidget {
-  const RepairSettingsScreen({super.key});
+  // Test-only seams; production passes neither.
+  final FirebaseFirestore? firestoreOverride;
+  final String? currentUidOverride;
+  const RepairSettingsScreen({super.key, this.firestoreOverride, this.currentUidOverride});
 
   @override
   State<RepairSettingsScreen> createState() => _RepairSettingsScreenState();
@@ -48432,6 +48992,12 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
   bool _togglingSimpleMode = false;
   bool _requireDailyCheckOn = true;
   bool _togglingRequireDailyCheck = false;
+  // Last save error / warning for the daily-check switch, shown inline under
+  // it (as well as in a SnackBar) so the exact reason stays visible.
+  String? _requireDailyCheckError;
+
+  FirebaseFirestore get _db => widget.firestoreOverride ?? FirebaseFirestore.instance;
+  String? get _uid => widget.currentUidOverride ?? FirebaseAuth.instance.currentUser?.uid;
 
   @override
   void initState() {
@@ -48440,14 +49006,13 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
   }
 
   Future<void> _load() async {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
+    final uid = _uid;
     if (uid != null) {
-      final userDoc =
-          await FirebaseFirestore.instance.collection('users').doc(uid).get();
+      final userDoc = await _db.collection('users').doc(uid).get();
       final role = userDoc.data()?['role'] as String?;
       _canEdit = role == 'admin' || role == 'owner';
     }
-    final settings = await _fetchRepairWorkflowSettings();
+    final settings = await _fetchRepairWorkflowSettings(db: _db);
     _managerLimitController.text = settings.managerApprovalLimit.toString();
     _multiQuoteThresholdController.text =
         settings.multiQuotationThreshold.toString();
@@ -48460,30 +49025,39 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
   }
 
   Future<void> _toggleRequireDailyCheck(bool newValue) async {
-    setState(() => _togglingRequireDailyCheck = true);
+    setState(() {
+      _togglingRequireDailyCheck = true;
+      _requireDailyCheckError = null;
+    });
     try {
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final userDoc =
-          await FirebaseFirestore.instance.collection('users').doc(uid).get();
-      final userName = (userDoc.data()?['name'] ?? 'Unknown').toString();
-      await FirebaseFirestore.instance
-          .collection('settings')
-          .doc('repair_workflow')
-          .set({'requireDailyCheck': newValue}, SetOptions(merge: true));
-      await _writeRepairEvent(
-        collection: 'settings',
-        docId: 'repair_workflow',
-        action: newValue ? 'REQUIRE_DAILY_CHECK_ON' : 'REQUIRE_DAILY_CHECK_OFF',
-        summary:
-            'Require Daily Vehicle Check turned ${newValue ? 'ON' : 'OFF'} by $userName',
-        actorUid: uid,
-        actorName: userName,
+      final result = await setRequireDailyCheck(on: newValue, db: _db, uid: _uid);
+      if (!mounted) return;
+      setState(() {
+        _requireDailyCheckOn = result.value;
+        _requireDailyCheckError = result.auditWarning == null
+            ? null
+            : 'Saved, but the audit log entry failed: ${result.auditWarning}';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.auditWarning == null
+              ? 'Daily Vehicle Check is now ${newValue ? 'REQUIRED' : 'OPTIONAL'}.'
+              : 'Saved (Daily Vehicle Check ${newValue ? 'REQUIRED' : 'OPTIONAL'}), '
+                  'but the audit log entry failed.'),
+        ),
       );
-      if (mounted) setState(() => _requireDailyCheckOn = newValue);
     } catch (e) {
+      final message = e is SettingsWriteException
+          ? e.message
+          : describeSettingsWriteError(e,
+              path: kRepairWorkflowSettingsPath, field: kRequireDailyCheckField);
       if (mounted) {
+        setState(() => _requireDailyCheckError = 'Not saved: $message');
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to change this setting: $e')),
+          SnackBar(
+            content: Text('Not saved: $message'),
+            duration: const Duration(seconds: 8),
+          ),
         );
       }
     } finally {
@@ -48507,11 +49081,10 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
     if (!confirmed) return;
     setState(() => _togglingSimpleMode = true);
     try {
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final userDoc =
-          await FirebaseFirestore.instance.collection('users').doc(uid).get();
+      final uid = _uid ?? '';
+      final userDoc = await _db.collection('users').doc(uid).get();
       final userName = (userDoc.data()?['name'] ?? 'Unknown').toString();
-      await FirebaseFirestore.instance
+      await _db
           .collection('settings')
           .doc('repair_workflow')
           .set({'simpleMode': newSimpleMode}, SetOptions(merge: true));
@@ -48522,6 +49095,7 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
         summary: 'Advanced Mode turned ${advancedOn ? 'ON' : 'OFF'} by $userName',
         actorUid: uid,
         actorName: userName,
+        db: _db,
       );
       if (mounted) setState(() => _simpleModeOn = newSimpleMode);
     } catch (e) {
@@ -48551,7 +49125,7 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
     if (!confirmed) return;
     setState(() => _togglingTestMode = true);
     try {
-      await setRepairTestMode(on: newValue);
+      await setRepairTestMode(on: newValue, db: _db, uid: _uid);
       if (mounted) setState(() => _testModeOn = newValue);
     } catch (e) {
       if (mounted) {
@@ -48584,7 +49158,7 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
     }
     setState(() => _saving = true);
     try {
-      await FirebaseFirestore.instance
+      await _db
           .collection('settings')
           .doc('repair_workflow')
           .set({
@@ -48611,6 +49185,8 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return TruckRepairScaffold(
+      firestoreOverride: widget.firestoreOverride,
+      currentUidOverride: widget.currentUidOverride,
       appBar: AppBar(
         title: const Text('Repair Settings'),
         backgroundColor: AppColors.navy,
@@ -48761,14 +49337,31 @@ class _RepairSettingsScreenState extends State<RepairSettingsScreen> {
                       const SizedBox(height: AppSpacing.sm),
                       if (_canEdit)
                         SwitchListTile(
+                          key: const ValueKey('require-daily-check-switch'),
                           contentPadding: EdgeInsets.zero,
                           title: const Text('Require Daily Vehicle Check Before Trips'),
                           value: _requireDailyCheckOn,
                           onChanged: _togglingRequireDailyCheck
                               ? null
                               : (val) => _toggleRequireDailyCheck(val),
-                        )
-                      else
+                        ),
+                      if (_canEdit && _requireDailyCheckError != null)
+                        Container(
+                          key: const ValueKey('require-daily-check-error'),
+                          width: double.infinity,
+                          margin: const EdgeInsets.only(top: AppSpacing.sm),
+                          padding: const EdgeInsets.all(AppSpacing.sm),
+                          decoration: BoxDecoration(
+                            color: AppColors.danger.withValues(alpha: 0.08),
+                            borderRadius: BorderRadius.circular(AppRadius.chip),
+                            border: Border.all(color: AppColors.danger.withValues(alpha: 0.4)),
+                          ),
+                          child: Text(
+                            _requireDailyCheckError!,
+                            style: AppText.caption.copyWith(color: AppColors.danger),
+                          ),
+                        ),
+                      if (!_canEdit)
                         Text(
                           _requireDailyCheckOn
                               ? 'Daily Vehicle Check is currently required.'
@@ -64691,6 +65284,129 @@ class _VehicleServiceHistoryScreenState extends State<VehicleServiceHistoryScree
 // vehicle overdue a service" are the same people who should see "did a
 // truck's levels get checked today", and no new permission key was worth
 // adding for one more read-only oversight screen.
+// ---- Company-truck daily check status (DailyChecksScreen, NOT CHECKED
+// TODAY tab) ----
+// The tab used to be built ONLY from today's active truck_sessions: a
+// company truck nobody had started a session on today never appeared in
+// either list, so 11 company trucks showed as 2 checked + 1 not checked.
+// It is now built from the trucks collection: every company truck
+// (truckOwnership == company) lands in exactly one of Checked / Not checked.
+
+// Match key for comparing vehicle numbers typed in different places
+// ("LM-6435", "lm 6435", "LM6435"). Display/matching only — doc ids keep
+// using normalizeVehicleNumber() unchanged.
+String vehicleMatchKey(String vehicleNumber) =>
+    normalizeVehicleNumber(vehicleNumber).replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+const String kNoDriverAssignedLabel = 'No driver assigned';
+
+class DailyCheckFleetRow {
+  final String truckId;
+  final String truckNumber;
+  // Assigned driver (trucks/{id}.assignedDriverName), else today's
+  // truck_sessions driver; null = no driver at all.
+  final String? driverName;
+  // Today's daily_checks doc for this truck, null = not checked.
+  final Map<String, dynamic>? check;
+  const DailyCheckFleetRow({
+    required this.truckId,
+    required this.truckNumber,
+    required this.driverName,
+    this.check,
+  });
+  bool get noDriver => driverName == null;
+}
+
+class DailyCheckFleetStatus {
+  final List<DailyCheckFleetRow> checked;
+  final List<DailyCheckFleetRow> notChecked;
+  // Active session today on a truck that is not a company truck (private,
+  // ownership not set, or no trucks doc) — listed separately, not counted.
+  final List<({String truckNumber, String driverName})> otherActive;
+  final int totalTrucks;
+  final int privateCount;
+  final int notSetCount;
+  const DailyCheckFleetStatus({
+    required this.checked,
+    required this.notChecked,
+    required this.otherActive,
+    required this.totalTrucks,
+    required this.privateCount,
+    required this.notSetCount,
+  });
+  int get companyCount => checked.length + notChecked.length;
+}
+
+DailyCheckFleetStatus buildDailyCheckFleetStatus({
+  required List<Map<String, dynamic>> trucks,
+  required List<Map<String, dynamic>> todayChecks,
+  List<Map<String, dynamic>> activeSessions = const [],
+}) {
+  final checkByKey = <String, Map<String, dynamic>>{};
+  for (final c in todayChecks) {
+    final key = vehicleMatchKey((c['vehicleNumber'] ?? '').toString());
+    if (key.isNotEmpty) checkByKey.putIfAbsent(key, () => c);
+  }
+  final sessionDriverByKey = <String, ({String truckNumber, String driverName})>{};
+  for (final sess in activeSessions) {
+    final number = (sess['truckNumber'] ?? '').toString().trim();
+    final key = vehicleMatchKey(number);
+    if (key.isEmpty) continue;
+    sessionDriverByKey[key] =
+        (truckNumber: normalizeVehicleNumber(number), driverName: (sess['driverName'] ?? '').toString().trim());
+  }
+  final checked = <DailyCheckFleetRow>[];
+  final notChecked = <DailyCheckFleetRow>[];
+  final companyKeys = <String>{};
+  var privateCount = 0;
+  var notSetCount = 0;
+  for (final t in trucks) {
+    switch (truckOwnership(t)) {
+      case TruckOwnership.private:
+        privateCount++;
+        continue;
+      case TruckOwnership.notSet:
+        notSetCount++;
+        continue;
+      case TruckOwnership.company:
+        break;
+    }
+    final number = normalizeVehicleNumber((t['truckNumber'] ?? '').toString());
+    final key = vehicleMatchKey(number);
+    // One row per vehicle even if two trucks docs carry the same number.
+    if (key.isNotEmpty && !companyKeys.add(key)) continue;
+    final assigned = (t['assignedDriverName'] ?? '').toString().trim();
+    final sessionDriver = sessionDriverByKey[key]?.driverName ?? '';
+    final row = DailyCheckFleetRow(
+      truckId: (t['id'] ?? '').toString(),
+      truckNumber: number.isEmpty ? '(no number)' : number,
+      driverName: assigned.isNotEmpty
+          ? assigned
+          : sessionDriver.isNotEmpty
+              ? sessionDriver
+              : null,
+      check: key.isEmpty ? null : checkByKey[key],
+    );
+    (row.check != null ? checked : notChecked).add(row);
+  }
+  int byNumber(DailyCheckFleetRow a, DailyCheckFleetRow b) => a.truckNumber.compareTo(b.truckNumber);
+  checked.sort(byNumber);
+  notChecked.sort(byNumber);
+  final otherActive = sessionDriverByKey.entries
+      .where((e) => !companyKeys.contains(e.key) && !checkByKey.containsKey(e.key))
+      .map((e) => e.value)
+      .toList()
+    ..sort((a, b) => a.truckNumber.compareTo(b.truckNumber));
+  return DailyCheckFleetStatus(
+    checked: checked,
+    notChecked: notChecked,
+    otherActive: otherActive,
+    totalTrucks: trucks.length,
+    privateCount: privateCount,
+    notSetCount: notSetCount,
+  );
+}
+
 class DailyChecksScreen extends StatefulWidget {
   final FirebaseFirestore? firestoreOverride;
   final String? currentUidOverride;
@@ -64731,6 +65447,7 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
   DateTime _rangeEnd = DateTime.now();
   String _vehicleSearch = '';
   bool _onlyLow = false;
+  bool _onlyDateIssues = false;
 
   bool _loading = true;
   Object? _loadError;
@@ -64738,7 +65455,11 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
 
   bool _loadingNotChecked = true;
   Object? _notCheckedError;
-  List<Map<String, String>> _notChecked = const [];
+  DailyCheckFleetStatus? _fleet;
+  // Non-fatal: truck_sessions list reads are admin/owner-only in the rules,
+  // so a SERVICE_VIEW staff user still gets the trucks-based lists.
+  Object? _sessionsError;
+  bool _viewerIsAdmin = false;
 
   @override
   void initState() {
@@ -64769,7 +65490,8 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
           .where('date', isGreaterThanOrEqualTo: startKey)
           .where('date', isLessThanOrEqualTo: endKey)
           .get();
-      final docs = snap.docs.map((d) => d.data()).toList()
+      // '_docId' is display-only (date mismatch diagnostics), never written.
+      final docs = snap.docs.map((d) => {...d.data(), '_docId': d.id}).toList()
         ..sort(
           (a, b) => (b['date'] ?? '').toString().compareTo((a['date'] ?? '').toString()),
         );
@@ -64781,41 +65503,62 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
     }
   }
 
-  // "Not checked today" = an active truck_sessions driver today whose
-  // vehicle has no daily_checks doc for today. Both queries are
-  // single-field-equality-only (date + status / date alone) — the diff is
-  // done client-side, which keeps this to the two cheapest possible reads.
+  // NOT CHECKED TODAY tab: every company truck (trucks collection,
+  // truckOwnership == company) vs today's daily_checks (Colombo day),
+  // matched with vehicleMatchKey(). truck_sessions only adds a driver name
+  // for trucks with no assigned driver and the "other active trucks" list.
   Future<void> _loadNotChecked() async {
     setState(() {
       _loadingNotChecked = true;
       _notCheckedError = null;
+      _sessionsError = null;
     });
     try {
-      final todayKey = dailyCheckDateKey(DateTime.now());
-      final sessionsSnap = await _db
-          .collection('truck_sessions')
-          .where('date', isEqualTo: todayKey)
-          .where('status', isEqualTo: 'active')
-          .get();
-      final activeByTruck = <String, String>{};
-      for (final d in sessionsSnap.docs) {
-        final data = d.data();
-        final truckNumber = (data['truckNumber'] ?? '').toString();
-        if (truckNumber.isEmpty) continue;
-        activeByTruck[normalizeVehicleNumber(truckNumber)] =
-            (data['driverName'] ?? '').toString();
-      }
+      final todayKey = colomboDateKey(DateTime.now());
+      final trucksSnap = await _db.collection('trucks').get();
+      final trucks = trucksSnap.docs.map((d) => {...d.data(), 'id': d.id}).toList();
       final checksSnap =
           await _db.collection('daily_checks').where('date', isEqualTo: todayKey).get();
-      final checkedVehicles = checksSnap.docs
-          .map((d) => normalizeVehicleNumber((d.data()['vehicleNumber'] ?? '').toString()))
-          .toSet();
-      final result = activeByTruck.entries
-          .where((e) => !checkedVehicles.contains(e.key))
-          .map((e) => {'truckNumber': e.key, 'driverName': e.value})
-          .toList()
-        ..sort((a, b) => a['truckNumber']!.compareTo(b['truckNumber']!));
-      if (mounted) setState(() => _notChecked = result);
+      final todayChecks = checksSnap.docs.map((d) => {...d.data(), '_docId': d.id}).toList();
+      var sessions = <Map<String, dynamic>>[];
+      Object? sessionsError;
+      try {
+        final sessionsSnap = await _db
+            .collection('truck_sessions')
+            .where('date', isEqualTo: todayKey)
+            .where('status', isEqualTo: 'active')
+            .get();
+        sessions = sessionsSnap.docs.map((d) => d.data()).toList();
+      } catch (e) {
+        debugPrint('[DAILY CHECKS] truck_sessions read failed (non-fatal): $e');
+        sessionsError = e;
+      }
+      var isAdmin = false;
+      final uid = widget.currentUidOverride ?? FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        try {
+          final role = (await _db.collection('users').doc(uid).get()).data()?['role'];
+          isAdmin = role == 'admin' || role == 'owner';
+        } catch (_) {}
+      }
+      final fleet = buildDailyCheckFleetStatus(
+        trucks: trucks,
+        todayChecks: todayChecks,
+        activeSessions: sessions,
+      );
+      // TEMP diagnostics (Task 13) — remove once the counts are confirmed live.
+      debugPrint('[DAILY CHECKS] date=$todayKey trucks=${fleet.totalTrucks} '
+          'company=${fleet.companyCount} private=${fleet.privateCount} '
+          'notSet=${fleet.notSetCount} checked=${fleet.checked.length} '
+          'notChecked=${fleet.notChecked.length} todayDocs=${todayChecks.length} '
+          'sessions=${sessions.length}');
+      if (mounted) {
+        setState(() {
+          _fleet = fleet;
+          _sessionsError = sessionsError;
+          _viewerIsAdmin = isAdmin;
+        });
+      }
     } catch (e) {
       if (mounted) setState(() => _notCheckedError = e);
     } finally {
@@ -64839,10 +65582,14 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
     }
   }
 
+  List<String> _dateIssues(Map<String, dynamic> d) =>
+      dailyCheckDateIssues((d['_docId'] ?? '').toString(), d);
+
   List<Map<String, dynamic>> get _filteredChecks {
     final q = _vehicleSearch.trim().toUpperCase();
     return _checks.where((d) {
       if (_onlyLow && d['hasLow'] != true) return false;
+      if (_onlyDateIssues && _dateIssues(d).isEmpty) return false;
       if (q.isNotEmpty &&
           !(d['vehicleNumber'] ?? '').toString().toUpperCase().contains(q)) {
         return false;
@@ -64961,14 +65708,31 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
                   ),
                 ),
               ),
-              Row(
+              Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 4,
                 children: [
-                  Text('Only LOW', style: AppText.caption),
-                  Switch(
-                    value: _onlyLow,
-                    onChanged: (v) => setState(() => _onlyLow = v),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('Only LOW', style: AppText.caption),
+                      Switch(
+                        value: _onlyLow,
+                        onChanged: (v) => setState(() => _onlyLow = v),
+                      ),
+                    ],
                   ),
-                  const Spacer(),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('Date issues', style: AppText.caption),
+                      Switch(
+                        key: const ValueKey('daily-checks-only-date-issues'),
+                        value: _onlyDateIssues,
+                        onChanged: (v) => setState(() => _onlyDateIssues = v),
+                      ),
+                    ],
+                  ),
                   Text('${filtered.length} record(s)', style: AppText.caption),
                 ],
               ),
@@ -64996,8 +65760,12 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
     final driverName = (data['driverName'] ?? '').toString();
     final date = (data['date'] ?? '').toString();
     final hasLow = data['hasLow'] == true;
-    final checks =
-        ((data['checks'] as List?) ?? const []).cast<Map<String, dynamic>>();
+    final checks = ((data['checks'] as List?) ?? const [])
+        .whereType<Map>()
+        .map((m) => Map<String, dynamic>.from(m))
+        .toList();
+    final photos = DailyCheckPhotoRef.fromChecks(checks);
+    final dateIssues = _dateIssues(data);
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpacing.sm),
       child: AppCard(
@@ -65025,18 +65793,41 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
                   ),
               ],
             ),
+            // Day = the stored `date` field (Asia/Colombo). Time = the
+            // driver's SUBMIT tap (deviceSubmittedAt) when stored, else the
+            // server save time — both shown in Colombo time.
             Text(
-              '$driverName • ${_repairFormatDateTime(data['submittedAt'])}',
+              '$driverName • $date • submitted '
+              '${formatColomboDateTime(data['deviceSubmittedAt'] ?? data['submittedAt'])}',
+              key: ValueKey('daily-check-caption-${data['_docId'] ?? vehicleNumber}'),
               style: AppText.caption,
             ),
+            if (dateIssues.isNotEmpty)
+              Container(
+                key: ValueKey('daily-check-date-issue-${data['_docId'] ?? vehicleNumber}'),
+                margin: const EdgeInsets.only(top: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppColors.warningBg,
+                  borderRadius: BorderRadius.circular(AppRadius.chip),
+                ),
+                child: Text(
+                  'DATE CHECK: ${dateIssues.join('; ')}\n'
+                  'doc ${data['_docId'] ?? '-'} · created '
+                  '${formatColomboDateTime(data['createdAt'])}',
+                  style: TextStyle(color: AppColors.warning, fontSize: 11),
+                ),
+              ),
             const SizedBox(height: AppSpacing.sm),
-            for (final c in checks)
+            for (var i = 0; i < checks.length; i++)
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: _checkLineRow(
                   vehicleNumber: vehicleNumber,
                   date: date,
-                  c: c,
+                  c: checks[i],
+                  photos: photos,
+                  index: i,
                 ),
               ),
           ],
@@ -65049,9 +65840,11 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
     required String vehicleNumber,
     required String date,
     required Map<String, dynamic> c,
+    required List<DailyCheckPhotoRef> photos,
+    required int index,
   }) {
     final low = (c['status'] ?? '').toString() == DailyCheckStatus.low;
-    final url = (c['photoUrl'] as String?);
+    final photo = photos[index];
     final label = (c['label'] ?? '').toString();
     final note = (c['note'] ?? '').toString();
     final id = (c['id'] ?? '').toString();
@@ -65061,45 +65854,19 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (url != null && url.isNotEmpty)
-              GestureDetector(
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => _InspectionPhotoPreviewScreen(
-                      photos: [_PhotoAttachmentItem(url: url)],
-                      initialIndex: 0,
-                    ),
-                  ),
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.network(
-                    url,
-                    width: 48,
-                    height: 48,
-                    fit: BoxFit.cover,
-                    cacheWidth: 144,
-                    cacheHeight: 144,
-                    errorBuilder: (_, __, ___) => Container(
-                      width: 48,
-                      height: 48,
-                      color: Colors.grey[300],
-                      child: const Icon(Icons.broken_image, size: 18),
-                    ),
-                  ),
-                ),
-              )
-            else
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: Colors.grey[200],
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Icon(Icons.image_not_supported, size: 18),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: DailyCheckPhoto(
+                key: ValueKey('admin-daily-check-photo-$vehicleNumber-$date-$id'),
+                photo: photo,
+                width: 64,
+                height: 64,
+                cacheSize: 192,
+                onTap: photo.hasPhoto
+                    ? () => DailyCheckPhotoViewerScreen.open(context, photos, index)
+                    : null,
               ),
+            ),
             const SizedBox(width: 8),
             Expanded(
               child: Column(
@@ -65142,57 +65909,192 @@ class _DailyChecksScreenState extends State<DailyChecksScreen>
 
   Widget _buildNotCheckedTab() {
     if (_loadingNotChecked) return const LoadingState();
-    if (_notCheckedError != null) {
+    if (_notCheckedError != null || _fleet == null) {
       return ErrorState(
         message: 'Failed to load: $_notCheckedError',
         onRetry: _loadNotChecked,
       );
     }
-    if (_notChecked.isEmpty) {
-      return const EmptyState(
-        icon: Icons.check_circle_outline,
-        title: 'ALL ACTIVE TRUCKS CHECKED TODAY',
-      );
-    }
-    return ListView.builder(
-      padding: const EdgeInsets.all(AppSpacing.md),
-      itemCount: _notChecked.length,
-      itemBuilder: (context, index) {
-        final item = _notChecked[index];
-        return Padding(
-          padding: const EdgeInsets.only(bottom: AppSpacing.sm),
-          child: AppCard(
-            child: Row(
+    final fleet = _fleet!;
+    Widget sectionTitle(String text, Key key) => Padding(
+          padding: const EdgeInsets.only(top: AppSpacing.md, bottom: AppSpacing.sm),
+          child: Text(text, key: key, style: AppText.section),
+        );
+    return RefreshIndicator(
+      onRefresh: _loadNotChecked,
+      child: ListView(
+        padding: const EdgeInsets.all(AppSpacing.md),
+        children: [
+          AppCard(
+            key: const ValueKey('daily-checks-fleet-counts'),
+            child: Wrap(
+              spacing: AppSpacing.lg,
+              runSpacing: AppSpacing.sm,
               children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(item['truckNumber'] ?? '', style: AppText.section),
-                      Text('Driver: ${item['driverName']}', style: AppText.caption),
-                    ],
-                  ),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: AppColors.warningBg,
-                    borderRadius: BorderRadius.circular(AppRadius.chip),
-                  ),
-                  child: Text(
-                    'NOT CHECKED',
-                    style: TextStyle(
-                      color: AppColors.warning,
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
+                _fleetCount('COMPANY TRUCKS', fleet.companyCount, AppColors.navy, 'company'),
+                _fleetCount('CHECKED TODAY', fleet.checked.length, AppColors.success, 'checked'),
+                _fleetCount('NOT CHECKED TODAY', fleet.notChecked.length, AppColors.warning, 'not-checked'),
               ],
             ),
           ),
-        );
-      },
+          if (fleet.notSetCount > 0)
+            Padding(
+              padding: const EdgeInsets.only(top: AppSpacing.sm),
+              child: InkWell(
+                key: const ValueKey('daily-checks-ownership-not-set'),
+                onTap: () async {
+                  await Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => TruckOwnershipScreen(
+                        firestoreOverride: widget.firestoreOverride,
+                        currentUidOverride: widget.currentUidOverride,
+                      ),
+                    ),
+                  );
+                  if (mounted) _loadNotChecked();
+                },
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline, size: 16, color: AppColors.warning),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '${fleet.notSetCount} truck${fleet.notSetCount == 1 ? ' has' : 's have'} '
+                        'no ownership set — not counted above. Open Truck Ownership',
+                        style: AppText.caption.copyWith(
+                          color: AppColors.navy,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (_sessionsError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: AppSpacing.sm),
+              child: Text(
+                "Couldn't read today's truck sessions — driver names come from "
+                'the truck assignment only.',
+                style: AppText.caption,
+              ),
+            ),
+          if (_viewerIsAdmin)
+            Padding(
+              padding: const EdgeInsets.only(top: AppSpacing.sm),
+              child: Text(
+                'Debug: trucks ${fleet.totalTrucks} · company ${fleet.companyCount} · '
+                'private ${fleet.privateCount} · not set ${fleet.notSetCount} · '
+                'checked ${fleet.checked.length} · not checked ${fleet.notChecked.length}',
+                key: const ValueKey('daily-checks-fleet-debug'),
+                style: AppText.caption,
+              ),
+            ),
+          sectionTitle('NOT CHECKED TODAY (${fleet.notChecked.length})',
+              const ValueKey('daily-checks-not-checked-title')),
+          if (fleet.notChecked.isEmpty)
+            Text(
+              fleet.companyCount == 0
+                  ? 'No company trucks found.'
+                  : 'ALL COMPANY TRUCKS CHECKED TODAY',
+              style: AppText.caption,
+            ),
+          for (final row in fleet.notChecked)
+            _fleetRowCard(
+              key: ValueKey('daily-checks-not-checked-${row.truckId}'),
+              truckNumber: row.truckNumber,
+              driverLine: row.noDriver ? kNoDriverAssignedLabel : 'Driver: ${row.driverName}',
+              chip: 'NOT CHECKED',
+              chipColor: AppColors.warning,
+              chipBg: AppColors.warningBg,
+            ),
+          sectionTitle('CHECKED TODAY (${fleet.checked.length})',
+              const ValueKey('daily-checks-checked-title')),
+          if (fleet.checked.isEmpty) Text('None yet.', style: AppText.caption),
+          for (final row in fleet.checked)
+            _fleetRowCard(
+              key: ValueKey('daily-checks-checked-${row.truckId}'),
+              truckNumber: row.truckNumber,
+              driverLine: 'Checked by ${(row.check!['driverName'] ?? row.driverName ?? '—')} · '
+                  '${formatColomboDateTime(row.check!['deviceSubmittedAt'] ?? row.check!['submittedAt'])}',
+              chip: row.check!['hasLow'] == true ? 'LOW' : 'CHECKED',
+              chipColor: row.check!['hasLow'] == true ? Colors.white : AppColors.success,
+              chipBg: row.check!['hasLow'] == true
+                  ? AppColors.danger
+                  : AppColors.success.withValues(alpha: 0.12),
+            ),
+          if (fleet.otherActive.isNotEmpty) ...[
+            sectionTitle('ACTIVE TODAY, NOT A COMPANY TRUCK (${fleet.otherActive.length})',
+                const ValueKey('daily-checks-other-active-title')),
+            for (final item in fleet.otherActive)
+              _fleetRowCard(
+                truckNumber: item.truckNumber,
+                driverLine: 'Driver: ${item.driverName}',
+                chip: 'NOT CHECKED',
+                chipColor: AppColors.warning,
+                chipBg: AppColors.warningBg,
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _fleetCount(String label, int value, Color color, String keyName) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          '$value',
+          key: ValueKey('daily-checks-count-$keyName'),
+          style: AppText.title.copyWith(color: color),
+        ),
+        Text(label, style: AppText.caption),
+      ],
+    );
+  }
+
+  Widget _fleetRowCard({
+    Key? key,
+    required String truckNumber,
+    required String driverLine,
+    required String chip,
+    required Color chipColor,
+    required Color chipBg,
+  }) {
+    return Padding(
+      key: key,
+      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+      child: AppCard(
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(truckNumber, style: AppText.section),
+                  Text(driverLine, style: AppText.caption),
+                ],
+              ),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: chipBg,
+                borderRadius: BorderRadius.circular(AppRadius.chip),
+              ),
+              child: Text(
+                chip,
+                style: TextStyle(color: chipColor, fontSize: 11, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -70517,7 +71419,7 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
     try {
       final snap = await _db
           .collection('daily_checks')
-          .doc(dailyCheckDocId(truckNumber, DateTime.now()))
+          .doc(colomboDailyCheckDocId(truckNumber, DateTime.now()))
           .get();
       return snap.exists ? snap.data() : null;
     } catch (e) {
@@ -70845,10 +71747,13 @@ class _DriverHomeScreenState extends State<DriverHomeScreen> {
 class DailyCheckSubmittedScreen extends StatelessWidget {
   final String truckNumber;
   final String dateKey;
+  // The saved check lines (for the photo thumbnails); null = not shown.
+  final List<Map<String, dynamic>>? checks;
   const DailyCheckSubmittedScreen({
     super.key,
     required this.truckNumber,
     required this.dateKey,
+    this.checks,
   });
 
   @override
@@ -70871,6 +71776,10 @@ class DailyCheckSubmittedScreen extends StatelessWidget {
                     textAlign: TextAlign.center,
                     style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
+                  if (checks != null) ...[
+                    const SizedBox(height: 16),
+                    DailyCheckPhotosGrid(checks: checks!, size: 88),
+                  ],
                   const SizedBox(height: 24),
                   SizedBox(
                     width: double.infinity,
@@ -70925,6 +71834,8 @@ class DailyCheckReadOnlyScreen extends StatelessWidget {
             style: const TextStyle(fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 12),
+          DailyCheckPhotosGrid(checks: checks),
+          const SizedBox(height: 12),
           for (final c in checks)
             Card(
               child: Padding(
@@ -70950,19 +71861,6 @@ class DailyCheckReadOnlyScreen extends StatelessWidget {
                     ),
                     if ((c['note'] ?? '').toString().isNotEmpty)
                       Text('Note: ${c['note']}'),
-                    if ((c['photoUrl'] ?? '').toString().isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.network(
-                          c['photoUrl'].toString(),
-                          height: 160,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) =>
-                              const Text('Photo could not be loaded.'),
-                        ),
-                      ),
-                    ],
                   ],
                 ),
               ),
@@ -73910,7 +74808,14 @@ class _FuelStationManagementScreenState
 // flow (NewWorkDialog). A Private Load never reads this at all — its
 // manual Distance (KM) entry is completely unaffected.
 class RouteDistanceManagementScreen extends StatefulWidget {
-  const RouteDistanceManagementScreen({super.key});
+  // Tests only; production uses FirebaseFirestore.instance.
+  final FirebaseFirestore? firestoreOverride;
+  final String? currentUidOverride;
+  const RouteDistanceManagementScreen({
+    super.key,
+    this.firestoreOverride,
+    this.currentUidOverride,
+  });
 
   @override
   State<RouteDistanceManagementScreen> createState() =>
@@ -73919,6 +74824,8 @@ class RouteDistanceManagementScreen extends StatefulWidget {
 
 class _RouteDistanceManagementScreenState
     extends State<RouteDistanceManagementScreen> {
+  FirebaseFirestore get _db => widget.firestoreOverride ?? FirebaseFirestore.instance;
+
   // Sites are fetched once (not streamed) right before the dialog opens, so
   // the dropdowns always render with a fully-populated, static items list —
   // avoids a DropdownButtonFormField assertion crash on Edit, where
@@ -73933,7 +74840,7 @@ class _RouteDistanceManagementScreenState
     );
     String? errorText;
 
-    final sitesSnap = await FirebaseFirestore.instance
+    final sitesSnap = await _db
         .collection('sites')
         .get();
     if (!mounted) return;
@@ -74061,7 +74968,7 @@ class _RouteDistanceManagementScreenState
                   return;
                 }
                 try {
-                  final ref = FirebaseFirestore.instance
+                  final ref = _db
                       .collection('route_distances')
                       .doc('${loadingSiteId}_$unloadingSiteId');
                   final existingDoc = await ref.get();
@@ -74087,7 +74994,7 @@ class _RouteDistanceManagementScreenState
   }
 
   Future<void> _deleteRoute(String docId) async {
-    await FirebaseFirestore.instance
+    await _db
         .collection('route_distances')
         .doc(docId)
         .delete();
@@ -74095,18 +75002,33 @@ class _RouteDistanceManagementScreenState
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    // Tab 1 is the unchanged saved-routes list; tab 2 is the read-only
+    // "distances from one loading site" table (RouteDistanceFromSiteView).
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
       appBar: AppBar(
         title: const Text('Route Distances'),
         backgroundColor: Colors.teal[800],
+        bottom: const TabBar(
+          indicatorColor: Colors.white,
+          labelColor: Colors.white,
+          unselectedLabelColor: Colors.white70,
+          tabs: [
+            Tab(key: ValueKey('route-tab-all'), text: 'ALL ROUTES'),
+            Tab(key: ValueKey('route-tab-from-site'), text: 'FROM LOADING SITE'),
+          ],
+        ),
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () => _showAddEditDialog(),
         tooltip: 'Add Route',
         child: const Icon(Icons.add),
       ),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: ReferenceCollectionCache.stream('sites'),
+      body: TabBarView(
+        children: [
+      StreamBuilder<QuerySnapshot>(
+        stream: ReferenceCollectionCache.stream('sites', db: widget.firestoreOverride),
         builder: (context, sitesSnapshot) {
           final siteNameById = <String, String>{
             for (final doc in sitesSnapshot.data?.docs ?? const [])
@@ -74114,7 +75036,7 @@ class _RouteDistanceManagementScreenState
                   .toString(),
           };
           return StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance
+            stream: _db
                 .collection('route_distances')
                 .snapshots(),
             builder: (context, snapshot) {
@@ -74183,6 +75105,13 @@ class _RouteDistanceManagementScreenState
             },
           );
         },
+      ),
+          RouteDistanceFromSiteView(
+            firestoreOverride: widget.firestoreOverride,
+            currentUidOverride: widget.currentUidOverride,
+          ),
+        ],
+      ),
       ),
     );
   }
@@ -74802,6 +75731,398 @@ class _AmountManagementScreenState extends State<_AmountManagementScreen> {
           );
         },
       ),
+    );
+  }
+}
+
+// ---------------- ROUTE DISTANCES FROM ONE LOADING SITE ----------------
+// Read-only. For the chosen Loading Site, every Unloading Site with its
+// distance, reusing the two distance sources the app already has:
+//  1. by road — the admin-configured route_distances/{L}_{U}.distanceKm
+//     (the same figure _lookupRouteDistanceKm puts on Company Loads);
+//  2. otherwise approx (straight line) — Geolocator.distanceBetween
+//     between the sites' saved GPS points (siteGpsLocations; nearest pair
+//     when a site has several gates), the same call live tracking uses;
+//  3. otherwise "No location" (a site without GPS points) — not an error.
+// No new API, nothing written.
+enum SiteDistanceSource { road, straightLine, noLocation }
+
+String siteDistanceSourceLabel(SiteDistanceSource s) {
+  switch (s) {
+    case SiteDistanceSource.road:
+      return 'by road';
+    case SiteDistanceSource.straightLine:
+      return 'approx (straight line)';
+    case SiteDistanceSource.noLocation:
+      return 'No location';
+  }
+}
+
+class SiteDistanceRow {
+  final String siteId;
+  final String siteName;
+  final double? km;
+  final SiteDistanceSource source;
+  const SiteDistanceRow({
+    required this.siteId,
+    required this.siteName,
+    required this.km,
+    required this.source,
+  });
+
+  String get kmText => km == null ? 'No location' : '${km!.toStringAsFixed(1)} km';
+}
+
+enum SiteDistanceSort { nearest, farthest, name }
+
+/// Nearest pair of GPS points between two sites, in km; null when either
+/// site has no saved location.
+double? straightLineKmBetweenSites(Map<String, dynamic> a, Map<String, dynamic> b) {
+  final pa = siteGpsLocations(a);
+  final pb = siteGpsLocations(b);
+  double? best;
+  for (final p in pa) {
+    final lat1 = (p['latitude'] as num?)?.toDouble();
+    final lng1 = (p['longitude'] as num?)?.toDouble();
+    if (lat1 == null || lng1 == null) continue;
+    for (final q in pb) {
+      final lat2 = (q['latitude'] as num?)?.toDouble();
+      final lng2 = (q['longitude'] as num?)?.toDouble();
+      if (lat2 == null || lng2 == null) continue;
+      final km = Geolocator.distanceBetween(lat1, lng1, lat2, lng2) / 1000;
+      if (best == null || km < best) best = km;
+    }
+  }
+  return best;
+}
+
+/// Rows for every Unloading Site (canBeUnloadingSite != false, not the
+/// loading site itself), sorted by [sort]; "No location" rows always last.
+List<SiteDistanceRow> buildSiteDistanceRows({
+  required String loadingSiteId,
+  required Map<String, Map<String, dynamic>> sitesById,
+  required Map<String, double> roadKmByUnloadingSiteId,
+  SiteDistanceSort sort = SiteDistanceSort.nearest,
+}) {
+  final loading = sitesById[loadingSiteId] ?? const <String, dynamic>{};
+  final rows = <SiteDistanceRow>[];
+  sitesById.forEach((id, data) {
+    if (id == loadingSiteId || data['canBeUnloadingSite'] == false) return;
+    final name = (data['name'] ?? '').toString();
+    final road = roadKmByUnloadingSiteId[id];
+    if (road != null) {
+      rows.add(SiteDistanceRow(siteId: id, siteName: name, km: road, source: SiteDistanceSource.road));
+      return;
+    }
+    final straight = straightLineKmBetweenSites(loading, data);
+    rows.add(SiteDistanceRow(
+      siteId: id,
+      siteName: name,
+      km: straight,
+      source: straight == null ? SiteDistanceSource.noLocation : SiteDistanceSource.straightLine,
+    ));
+  });
+  int byName(SiteDistanceRow a, SiteDistanceRow b) =>
+      a.siteName.toUpperCase().compareTo(b.siteName.toUpperCase());
+  rows.sort((a, b) {
+    if (sort == SiteDistanceSort.name) return byName(a, b);
+    if (a.km == null || b.km == null) {
+      if (a.km == null && b.km == null) return byName(a, b);
+      return a.km == null ? 1 : -1;
+    }
+    final c = sort == SiteDistanceSort.nearest ? a.km!.compareTo(b.km!) : b.km!.compareTo(a.km!);
+    return c != 0 ? c : byName(a, b);
+  });
+  return rows;
+}
+
+/// Columns of the distances table (also what PDF/PNG export prints).
+List<DataTableColumn<SiteDistanceRow>> siteDistanceTableColumns() => [
+      DataTableColumn<SiteDistanceRow>(
+        label: 'Unloading Site',
+        width: 200,
+        cellBuilder: (_, r) => Text(r.siteName, maxLines: 2, overflow: TextOverflow.ellipsis),
+        exportValue: (r) => r.siteName,
+      ),
+      DataTableColumn<SiteDistanceRow>(
+        label: 'Distance (km)',
+        width: 120,
+        numeric: true,
+        cellBuilder: (_, r) => Text(
+          r.kmText,
+          key: ValueKey('route-from-site-km-${r.siteId}'),
+          style: TextStyle(
+            fontWeight: r.km == null ? FontWeight.normal : FontWeight.w700,
+            color: r.km == null ? AppColors.textSecondary : null,
+          ),
+        ),
+        exportValue: (r) => r.km == null ? 'No location' : r.km!.toStringAsFixed(1),
+      ),
+      DataTableColumn<SiteDistanceRow>(
+        label: 'Type',
+        width: 180,
+        cellBuilder: (_, r) => Text(
+          siteDistanceSourceLabel(r.source),
+          style: AppText.caption.copyWith(
+            color: r.source == SiteDistanceSource.road
+                ? AppColors.success
+                : r.source == SiteDistanceSource.straightLine
+                    ? AppColors.warning
+                    : AppColors.textSecondary,
+          ),
+        ),
+        exportValue: (r) => siteDistanceSourceLabel(r.source),
+      ),
+    ];
+
+class RouteDistanceFromSiteView extends StatefulWidget {
+  final FirebaseFirestore? firestoreOverride;
+  final String? currentUidOverride;
+  const RouteDistanceFromSiteView({super.key, this.firestoreOverride, this.currentUidOverride});
+
+  @override
+  State<RouteDistanceFromSiteView> createState() => _RouteDistanceFromSiteViewState();
+}
+
+class _RouteDistanceFromSiteViewState extends State<RouteDistanceFromSiteView> {
+  FirebaseFirestore get _db => widget.firestoreOverride ?? FirebaseFirestore.instance;
+  late final Stream<QuerySnapshot> _sitesStream =
+      ReferenceCollectionCache.stream('sites', db: widget.firestoreOverride);
+  late final Stream<QuerySnapshot> _routesStream = _db.collection('route_distances').snapshots();
+
+  final _searchController = TextEditingController();
+  final _table = DataTableController<SiteDistanceRow>();
+  String? _loadingSiteId;
+  String _search = '';
+  String _filter = 'all';
+  SiteDistanceSort _sort = SiteDistanceSort.nearest;
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickLoadingSite(Map<String, Map<String, dynamic>> sitesById) async {
+    final options = sitesById.entries
+        .where((e) => e.value['canBeLoadingSite'] != false)
+        .toList()
+      ..sort((a, b) => (a.value['name'] ?? '')
+          .toString()
+          .toUpperCase()
+          .compareTo((b.value['name'] ?? '').toString().toUpperCase()));
+    var query = '';
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) {
+          final q = query.trim().toUpperCase();
+          final shown = options
+              .where((e) => q.isEmpty || (e.value['name'] ?? '').toString().toUpperCase().contains(q))
+              .toList();
+          return AlertDialog(
+            title: const Text('Select Loading Site'),
+            content: SizedBox(
+              width: 360,
+              height: 420,
+              child: Column(
+                children: [
+                  TextField(
+                    key: const ValueKey('route-from-site-picker-search'),
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      hintText: 'Search loading site',
+                      prefixIcon: Icon(Icons.search),
+                      isDense: true,
+                    ),
+                    onChanged: (v) => setDialogState(() => query = v),
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: shown.isEmpty
+                        ? const Center(child: Text('No matching sites'))
+                        : ListView(
+                            children: [
+                              for (final e in shown)
+                                ListTile(
+                                  key: ValueKey('route-from-site-option-${e.key}'),
+                                  dense: true,
+                                  leading: const Icon(Icons.place_outlined),
+                                  title: Text((e.value['name'] ?? '').toString()),
+                                  selected: e.key == _loadingSiteId,
+                                  onTap: () => Navigator.pop(dialogContext, e.key),
+                                ),
+                            ],
+                          ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('Cancel'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (picked != null && mounted) setState(() => _loadingSiteId = picked);
+  }
+
+
+  String _sortLabel(SiteDistanceSort s) => switch (s) {
+        SiteDistanceSort.nearest => 'Nearest first',
+        SiteDistanceSort.farthest => 'Farthest first',
+        SiteDistanceSort.name => 'A–Z',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: _sitesStream,
+      builder: (context, sitesSnap) {
+        if (sitesSnap.hasError) {
+          return Center(child: Text('Failed to load sites: ${sitesSnap.error}'));
+        }
+        if (!sitesSnap.hasData) return const Center(child: CircularProgressIndicator());
+        final sitesById = <String, Map<String, dynamic>>{
+          for (final d in sitesSnap.data!.docs) d.id: (d.data() as Map<String, dynamic>),
+        };
+        final loadingName =
+            _loadingSiteId == null ? null : (sitesById[_loadingSiteId]?['name'] ?? '').toString();
+        final picker = SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            key: const ValueKey('route-from-site-picker'),
+            onPressed: () => _pickLoadingSite(sitesById),
+            icon: const Icon(Icons.place),
+            label: Text(
+              loadingName == null ? 'Select loading site' : 'Loading site: $loadingName',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        );
+        if (_loadingSiteId == null) {
+          return Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              children: [
+                picker,
+                const Expanded(
+                  child: Center(
+                    child: Text(
+                      'Select a loading site to see the distance to every unloading site.',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+        return StreamBuilder<QuerySnapshot>(
+          stream: _routesStream,
+          builder: (context, routesSnap) {
+            final road = <String, double>{};
+            for (final d in routesSnap.data?.docs ?? const <QueryDocumentSnapshot>[]) {
+              final m = d.data() as Map<String, dynamic>;
+              final km = (m['distanceKm'] as num?)?.toDouble();
+              if (m['loadingSiteId'] == _loadingSiteId && km != null && km > 0) {
+                road[(m['unloadingSiteId'] ?? '').toString()] = km;
+              }
+            }
+            final all = buildSiteDistanceRows(
+              loadingSiteId: _loadingSiteId!,
+              sitesById: sitesById,
+              roadKmByUnloadingSiteId: road,
+              sort: _sort,
+            );
+            final q = _search.trim().toUpperCase();
+            final searched =
+                all.where((r) => q.isEmpty || r.siteName.toUpperCase().contains(q)).toList();
+            final shown = _filter == 'all'
+                ? searched
+                : searched.where((r) => r.source.name == _filter).toList();
+            int count(SiteDistanceSource s) => searched.where((r) => r.source == s).length;
+            return Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  picker,
+                  const SizedBox(height: 8),
+                  DataTableToolbar(
+                    searchController: _searchController,
+                    searchHint: 'Search unloading site',
+                    onSearchChanged: (v) => setState(() => _search = v),
+                    selectedFilter: _filter,
+                    onFilterChanged: (v) => setState(() => _filter = v),
+                    filters: [
+                      DataTableFilterOption(value: 'all', label: 'ALL', count: searched.length),
+                      DataTableFilterOption(
+                        value: SiteDistanceSource.road.name,
+                        label: 'BY ROAD',
+                        count: count(SiteDistanceSource.road),
+                      ),
+                      DataTableFilterOption(
+                        value: SiteDistanceSource.straightLine.name,
+                        label: 'STRAIGHT LINE',
+                        count: count(SiteDistanceSource.straightLine),
+                      ),
+                      DataTableFilterOption(
+                        value: SiteDistanceSource.noLocation.name,
+                        label: 'NO LOCATION',
+                        count: count(SiteDistanceSource.noLocation),
+                      ),
+                    ],
+                    onExport: (f) => exportDataTable<SiteDistanceRow>(
+                      context,
+                      format: f,
+                      controller: _table,
+                      title: 'Distances from $loadingName',
+                      filters: describeTableFilters(
+                        statusLabel: _filter == 'all'
+                            ? null
+                            : siteDistanceSourceLabel(SiteDistanceSource.values.byName(_filter)),
+                        search: _search,
+                        extra: {'Sort': _sortLabel(_sort)},
+                      ),
+                      db: widget.firestoreOverride,
+                      uid: widget.currentUidOverride,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 6,
+                    children: [
+                      for (final s in SiteDistanceSort.values)
+                        ChoiceChip(
+                          key: ValueKey('route-from-site-sort-${s.name}'),
+                          label: Text(_sortLabel(s)),
+                          selected: _sort == s,
+                          onSelected: (_) => setState(() => _sort = s),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: DataTableView<SiteDistanceRow>(
+                      controller: _table,
+                      columns: siteDistanceTableColumns(),
+                      rows: shown,
+                      rowKey: (r) => r.siteId,
+                      resetPageKey: '$_loadingSiteId|$_search|$_filter|$_sort',
+                      emptyState: const Center(child: Text('No unloading sites match.')),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }
